@@ -2,22 +2,23 @@
 Duplicate file scanner engine.
 
 Uses a progressive strategy to minimize I/O:
-  1. Enumerate files (os.scandir, skipping system/junk dirs)
+  1. Enumerate files (os.scandir, skipping system/junk dirs + cloud files)
   2. Group by chosen criteria (name, size)
-  3. Partial hash (first + last 64 KB) – cheap pre-filter
-  4. Full hash (streamed, parallel via ThreadPoolExecutor)
+  3. Partial hash (first + last 64 KB) – parallel, batched with timeout
+  4. Full hash (streamed, parallel, batched with timeout)
 
-This avoids reading entire multi-GB files unless truly necessary.
+Cloud / placeholder files (OneDrive, iCloud, etc.) are detected via
+Windows file attributes and skipped automatically so they never block I/O.
 """
 
 from __future__ import annotations
 
 import os
+import sys
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from pathlib import Path
 from typing import Callable
 
 import xxhash
@@ -27,18 +28,31 @@ import xxhash
 # ---------------------------------------------------------------------------
 PARTIAL_CHUNK = 64 * 1024        # 64 KB for partial hash
 FULL_CHUNK    = 4 * 1024 * 1024  # 4 MB read buffer for full hash
+HASH_BATCH    = 5_000            # files per parallel batch
+BATCH_TIMEOUT_PER_FILE = 0.1     # seconds budget per file in a batch
+BATCH_TIMEOUT_MIN = 120          # minimum batch timeout (seconds)
 
 # Directories to always skip (case-insensitive on Windows)
-# ONLY truly useless system dirs – no user content lives here
 SKIP_DIRS: set[str] = {
     # Windows system (never contain user duplicates)
     "$recycle.bin", "system volume information", "$windows.~bt",
     "$windows.~ws", "windows", "windows.old",
     "recovery", "config.msi", "msocache",
-    # Dev tooling (version-controlled / generated – not real duplicates)
+    # Dev tooling (version-controlled / generated)
     ".git", ".hg", ".svn", "node_modules", "__pycache__",
     ".venv", "venv",
 }
+
+# Windows file attributes that indicate cloud / placeholder / offline files.
+# Reading these files can trigger a download from OneDrive / iCloud / etc.
+# and block for minutes or forever.  We skip them during enumeration.
+#   FILE_ATTRIBUTE_OFFLINE              = 0x0000_1000
+#   FILE_ATTRIBUTE_RECALL_ON_OPEN       = 0x0004_0000
+#   FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS= 0x0040_0000
+#   FILE_ATTRIBUTE_VIRTUAL              = 0x0001_0000
+_WIN_CLOUD_ATTRS = 0
+if sys.platform == "win32":
+    _WIN_CLOUD_ATTRS = 0x1000 | 0x40000 | 0x400000 | 0x10000
 
 
 class DuplicateMode(Enum):
@@ -68,6 +82,7 @@ class DuplicateGroup:
 # Callback types
 ProgressCallback = Callable[[str, int, int], None]
 CancelCheck = Callable[[], bool]
+
 
 # ---------------------------------------------------------------------------
 # Hashing helpers
@@ -100,6 +115,15 @@ def _full_hash(path: str) -> str:
         return ""
 
 
+def _is_cloud_file(st) -> bool:
+    """Return True if the file is a cloud placeholder / offline file (Windows)."""
+    if _WIN_CLOUD_ATTRS:
+        attrs = getattr(st, "st_file_attributes", 0)
+        if attrs & _WIN_CLOUD_ATTRS:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Fast directory walker
 # ---------------------------------------------------------------------------
@@ -110,15 +134,19 @@ def _walk_fast(
     skip_dirs: set[str],
     cancelled: CancelCheck,
     progress: ProgressCallback,
-) -> list[FileEntry]:
-    """Walk directory tree using os.scandir with directory filtering."""
+) -> tuple[list[FileEntry], int]:
+    """Walk directory tree using os.scandir with filtering.
+
+    Returns (files, skipped_cloud_count).
+    """
     all_files: list[FileEntry] = []
     count = 0
+    skipped_cloud = 0
     dirs_to_walk = [root]
 
     while dirs_to_walk:
         if cancelled():
-            return []
+            return [], 0
         current = dirs_to_walk.pop()
         try:
             with os.scandir(current) as it:
@@ -129,6 +157,10 @@ def _walk_fast(
                                 dirs_to_walk.append(entry.path)
                         elif entry.is_file(follow_symlinks=False):
                             st = entry.stat(follow_symlinks=False)
+                            # Skip cloud / placeholder files
+                            if _is_cloud_file(st):
+                                skipped_cloud += 1
+                                continue
                             if st.st_size >= min_size:
                                 all_files.append(FileEntry(
                                     path=entry.path,
@@ -138,13 +170,93 @@ def _walk_fast(
                                 ))
                                 count += 1
                                 if count % 5000 == 0:
-                                    progress("Enumerating files…", count, 0)
+                                    progress(
+                                        f"Enumerating files… {count:,}"
+                                        + (f" ({skipped_cloud:,} cloud skipped)" if skipped_cloud else ""),
+                                        count, 0,
+                                    )
                     except (OSError, PermissionError):
                         continue
         except (OSError, PermissionError):
             continue
 
-    return all_files
+    return all_files, skipped_cloud
+
+
+# ---------------------------------------------------------------------------
+# Batched parallel hashing  (the key to never freezing)
+# ---------------------------------------------------------------------------
+
+def _parallel_hash_phase(
+    files: list[FileEntry],
+    hash_fn: Callable[[str], str],
+    assign_fn: Callable[[FileEntry, str], None],
+    workers: int,
+    cancelled: CancelCheck,
+    progress: ProgressCallback,
+    phase_label: str,
+) -> int:
+    """
+    Hash *files* in parallel, in batches with timeouts.
+
+    *hash_fn*:   takes a path, returns a hash string (or "")
+    *assign_fn*: called with (fe, hash) for each successful result
+    *workers*:   thread count
+
+    Returns the number of files skipped (timed-out or errored).
+    """
+    total = len(files)
+    done = 0
+    skipped = 0
+
+    for batch_start in range(0, total, HASH_BATCH):
+        if cancelled():
+            return skipped
+
+        batch = files[batch_start : batch_start + HASH_BATCH]
+        batch_timeout = max(BATCH_TIMEOUT_MIN, len(batch) * BATCH_TIMEOUT_PER_FILE)
+
+        pool = ThreadPoolExecutor(max_workers=workers)
+        futs = {pool.submit(hash_fn, fe.path): fe for fe in batch}
+
+        try:
+            for future in as_completed(futs, timeout=batch_timeout):
+                if cancelled():
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    return skipped
+                try:
+                    h = future.result(timeout=0)  # already complete
+                    fe = futs[future]
+                    if h:
+                        assign_fn(fe, h)
+                except Exception:
+                    skipped += 1
+                done += 1
+                if done % 2000 == 0:
+                    progress(
+                        f"{phase_label} {done:,}/{total:,}"
+                        + (f" ({skipped} skipped)" if skipped else ""),
+                        done, total,
+                    )
+        except TimeoutError:
+            # Some futures in this batch are stuck — count and abandon them
+            n_stuck = sum(1 for f in futs if not f.done())
+            skipped += n_stuck
+            done += n_stuck
+            progress(
+                f"{phase_label} {done:,}/{total:,} ({skipped} skipped – batch timeout)",
+                done, total,
+            )
+
+        # Shut down pool WITHOUT waiting for stuck threads
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    progress(
+        f"{phase_label} {done:,}/{total:,}"
+        + (f" ({skipped} skipped)" if skipped else "") + " ✓",
+        total, total,
+    )
+    return skipped
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +283,7 @@ def scan_directory(
     _progress = progress or (lambda *_: None)
     _cancelled = cancelled or (lambda: False)
     skip = SKIP_DIRS | (extra_skip_dirs or set())
+    workers = min(4, (os.cpu_count() or 2))
 
     # ------------------------------------------------------------------
     # Phase 1 – enumerate files
@@ -178,9 +291,10 @@ def scan_directory(
     _progress("Phase 1 · Enumerating files…", 0, 0)
 
     if recursive:
-        all_files = _walk_fast(root, min_size, skip, _cancelled, _progress)
+        all_files, cloud_skipped = _walk_fast(root, min_size, skip, _cancelled, _progress)
     else:
         all_files = []
+        cloud_skipped = 0
         try:
             with os.scandir(root) as it:
                 for entry in it:
@@ -189,6 +303,9 @@ def scan_directory(
                     try:
                         if entry.is_file(follow_symlinks=False):
                             st = entry.stat(follow_symlinks=False)
+                            if _is_cloud_file(st):
+                                cloud_skipped += 1
+                                continue
                             if st.st_size >= min_size:
                                 all_files.append(FileEntry(
                                     path=entry.path,
@@ -202,7 +319,11 @@ def scan_directory(
             pass
 
     total_files = len(all_files)
-    _progress(f"Phase 1 · {total_files:,} files found", total_files, total_files)
+    cloud_msg = f" ({cloud_skipped:,} cloud files skipped)" if cloud_skipped else ""
+    _progress(
+        f"Phase 1 · {total_files:,} files found{cloud_msg}",
+        total_files, total_files,
+    )
 
     if _cancelled() or total_files == 0:
         return []
@@ -210,7 +331,7 @@ def scan_directory(
     results: list[DuplicateGroup] = []
 
     # ------------------------------------------------------------------
-    # Phase 2 – group by name (optional)
+    # Phase 2 – group by name (optional, no hash needed)
     # ------------------------------------------------------------------
     if by_name and not by_size and not by_hash:
         _progress("Phase 2 · Grouping by name…", 0, total_files)
@@ -232,7 +353,6 @@ def scan_directory(
     for fe in all_files:
         size_map[fe.size].append(fe)
 
-    # Keep only groups with 2+ files
     size_groups = {sz: grp for sz, grp in size_map.items() if len(grp) >= 2}
     del size_map
 
@@ -252,23 +372,26 @@ def scan_directory(
         return results
 
     # ------------------------------------------------------------------
-    # Phase 3 – partial hash (fast pre-filter)
+    # Phase 3 – partial hash (parallel, batched with timeout)
     # ------------------------------------------------------------------
     candidates = [fe for grp in size_groups.values() for fe in grp]
     del size_groups
-    total_candidates = len(candidates)
-    _progress(f"Phase 3 · Partial hashing {total_candidates:,} files…", 0, total_candidates)
 
     partial_map: dict[str, list[FileEntry]] = defaultdict(list)
-    for i, fe in enumerate(candidates):
-        if _cancelled():
-            return []
-        fe.partial_hash = _partial_hash(fe.path)
-        if fe.partial_hash:
-            key = f"{fe.size}:{fe.partial_hash}"
-            partial_map[key].append(fe)
-        if i % 2000 == 0:
-            _progress(f"Phase 3 · Partial hash {i:,}/{total_candidates:,}", i, total_candidates)
+
+    def _assign_partial(fe: FileEntry, h: str):
+        fe.partial_hash = h
+        partial_map[f"{fe.size}:{h}"].append(fe)
+
+    _parallel_hash_phase(
+        candidates,
+        hash_fn=_partial_hash,
+        assign_fn=_assign_partial,
+        workers=workers,
+        cancelled=_cancelled,
+        progress=_progress,
+        phase_label="Phase 3 · Partial hash",
+    )
 
     del candidates
     partial_groups = {k: g for k, g in partial_map.items() if len(g) >= 2}
@@ -276,58 +399,42 @@ def scan_directory(
 
     _progress(
         f"Phase 3 · {len(partial_groups):,} groups need full hash",
-        total_candidates, total_candidates,
+        1, 1,
     )
 
     if _cancelled():
         return []
 
     # ------------------------------------------------------------------
-    # Phase 4 – full hash (parallel with ThreadPoolExecutor)
+    # Phase 4 – full hash (parallel, batched with timeout)
     # ------------------------------------------------------------------
     full_candidates = sorted(
         [fe for grp in partial_groups.values() for fe in grp],
         key=lambda fe: fe.size,
     )
     del partial_groups
-    total_full = len(full_candidates)
-    _progress(f"Phase 4 · Full hashing {total_full:,} files…", 0, total_full)
 
-    # Parallel full hashing – I/O bound so threads work well
-    workers = min(4, (os.cpu_count() or 2))
-    done = 0
-
-    def _hash_one(fe: FileEntry) -> tuple[FileEntry, str]:
-        return fe, _full_hash(fe.path)
-
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_hash_one, fe): fe for fe in full_candidates}
-        for future in as_completed(futures):
-            if _cancelled():
-                pool.shutdown(wait=False, cancel_futures=True)
-                return []
-            try:
-                fe, h = future.result()
-                fe.full_hash = h
-            except Exception:
-                pass
-            done += 1
-            if done % 500 == 0 or done == total_full:
-                _progress(f"Phase 4 · Full hash {done:,}/{total_full:,}", done, total_full)
-
-    # Re-group by full hash
     full_map: dict[str, list[FileEntry]] = defaultdict(list)
-    for fe in full_candidates:
-        if fe.full_hash:
-            key = f"{fe.size}:{fe.full_hash}"
-            full_map[key].append(fe)
+
+    def _assign_full(fe: FileEntry, h: str):
+        fe.full_hash = h
+        full_map[f"{fe.size}:{h}"].append(fe)
+
+    _parallel_hash_phase(
+        full_candidates,
+        hash_fn=_full_hash,
+        assign_fn=_assign_full,
+        workers=workers,
+        cancelled=_cancelled,
+        progress=_progress,
+        phase_label="Phase 4 · Full hash",
+    )
 
     for key, grp in full_map.items():
         if len(grp) >= 2:
             results.append(DuplicateGroup(DuplicateMode.HASH, key, grp))
 
-    # Sort by total wasted space (largest groups first)
     results.sort(key=lambda g: g.files[0].size * (len(g.files) - 1), reverse=True)
 
-    _progress(f"Done · {len(results):,} duplicate groups", total_full, total_full)
+    _progress(f"Done · {len(results):,} duplicate groups", 1, 1)
     return results

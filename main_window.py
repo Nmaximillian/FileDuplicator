@@ -558,8 +558,15 @@ class MainWindow(QMainWindow):
 
     def _on_context_menu(self, pos):
         item = self._tree.itemAt(pos)
-        if item is None or item.parent() is None:
+        if item is None:
             return
+
+        # ---- Group header row (no parent) ----
+        if item.parent() is None:
+            self._show_group_context_menu(item, pos)
+            return
+
+        # ---- Individual file row ----
         path = item.data(0, Qt.ItemDataRole.UserRole)
         if not path:
             return
@@ -585,6 +592,62 @@ class MainWindow(QMainWindow):
                 item.setCheckState(0, Qt.CheckState.Unchecked)
             else:
                 item.setCheckState(0, Qt.CheckState.Checked)
+
+    def _show_group_context_menu(self, group_item: QTreeWidgetItem, pos):
+        """Context menu for a group header – bulk actions for all files in this group."""
+        menu = QMenu(self)
+        act_delete_all = menu.addAction("🗑  Mark ALL in group as DELETE")
+        act_keep_all = menu.addAction("✅  Mark ALL in group as KEEP")
+        menu.addSeparator()
+        act_keep_oldest = menu.addAction("📅  Keep oldest, delete rest")
+        menu.addSeparator()
+        act_expand = menu.addAction("▶  Expand group")
+        act_collapse = menu.addAction("▼  Collapse group")
+
+        gi = self._tree.indexOfTopLevelItem(group_item)
+        color = GROUP_COLORS[gi % len(GROUP_COLORS)]
+
+        chosen = menu.exec(self._tree.viewport().mapToGlobal(pos))
+        if chosen == act_delete_all:
+            self._set_group_action(group_item, color, delete_all=True)
+        elif chosen == act_keep_all:
+            self._set_group_action(group_item, color, delete_all=False)
+        elif chosen == act_keep_oldest:
+            self._set_group_keep_oldest(group_item, color)
+        elif chosen == act_expand:
+            group_item.setExpanded(True)
+        elif chosen == act_collapse:
+            group_item.setExpanded(False)
+
+    def _set_group_action(self, group_item: QTreeWidgetItem, color: QColor, *, delete_all: bool):
+        """Mark every file in a group as DELETE or KEEP."""
+        self._tree.blockSignals(True)
+        for ci in range(group_item.childCount()):
+            child = group_item.child(ci)
+            if delete_all:
+                child.setCheckState(0, Qt.CheckState.Checked)
+                child.setText(0, "DELETE")
+                child.setForeground(0, TEXT_COLOR_DEL)
+            else:
+                child.setCheckState(0, Qt.CheckState.Unchecked)
+                child.setText(0, "KEEP")
+                child.setForeground(0, TEXT_COLOR_KEEP)
+        self._tree.blockSignals(False)
+
+    def _set_group_keep_oldest(self, group_item: QTreeWidgetItem, color: QColor):
+        """Keep the oldest (first) file, mark the rest as DELETE."""
+        self._tree.blockSignals(True)
+        for ci in range(group_item.childCount()):
+            child = group_item.child(ci)
+            if ci == 0:
+                child.setCheckState(0, Qt.CheckState.Unchecked)
+                child.setText(0, "KEEP")
+                child.setForeground(0, TEXT_COLOR_KEEP)
+            else:
+                child.setCheckState(0, Qt.CheckState.Checked)
+                child.setText(0, "DELETE")
+                child.setForeground(0, TEXT_COLOR_DEL)
+        self._tree.blockSignals(False)
 
     # ---------------------------------------------- bulk selection
     def _auto_select_newer(self):
