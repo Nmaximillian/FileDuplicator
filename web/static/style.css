@@ -1,4 +1,4 @@
-/* File Duplicator – Web UI styles */
+/* File Duplicator – Web UI styles (v2) */
 
 body {
     background: #1a1a2e;
@@ -14,7 +14,7 @@ body {
     border-color: #2a3a4a;
 }
 
-/* Group colours – dark-theme friendly */
+/* Group colours – dark-theme friendly (8 rotating) */
 .dup-group:nth-child(8n+1) { --gc: #1a3a4a; }
 .dup-group:nth-child(8n+2) { --gc: #3a2a1a; }
 .dup-group:nth-child(8n+3) { --gc: #1a3a1a; }
@@ -121,12 +121,12 @@ body {
     border: 1px solid #444;
     border-radius: 6px;
     padding: 4px 0;
-    min-width: 200px;
+    min-width: 220px;
     box-shadow: 0 4px 16px rgba(0,0,0,0.5);
 }
 
 .ctx-menu-item {
-    padding: 6px 16px;
+    padding: 7px 16px;
     cursor: pointer;
     color: #dde;
     font-size: 0.875rem;
@@ -139,14 +139,35 @@ body {
     background: #3a3a5e;
 }
 
+.ctx-menu-item.text-danger {
+    color: #ef9a9a !important;
+}
+
+.ctx-menu-item.text-success {
+    color: #81c784 !important;
+}
+
+.ctx-menu-item.text-warning {
+    color: #ffcc80 !important;
+}
+
 .ctx-menu-sep {
     border-top: 1px solid #444;
     margin: 4px 0;
+}
+
+/* Load more area */
+#loadMoreArea {
+    border-top: 1px solid rgba(255,255,255,0.08);
+    margin-top: 10px;
 }
 
 /* Responsive tweaks */
 @media (max-width: 768px) {
     .dup-table .hash-cell {
         display: none;
+    }
+    .dup-table .path-cell {
+        max-width: 200px;
     }
 }

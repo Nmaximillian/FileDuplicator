@@ -1,11 +1,20 @@
 /**
- * File Duplicator – Web UI logic
+ * File Duplicator – Web UI logic (v2)
+ *
+ * Major improvements over v1:
+ *  - Paginated group loading (50 at a time) – no more browser crash
+ *  - Group-level context menu: Mark All Delete / Keep All / Keep Oldest
+ *  - Groups sorted by size descending (biggest waste first)
+ *  - Lazy expand: first 3 groups expanded, rest collapsed
  */
 
 // ── State ──
 let currentJobId = null;
-let scanGroups = [];
 let eventSource = null;
+let loadedGroupCount = 0;
+let totalGroupCount = 0;
+let summaryData = null;
+const PAGE_SIZE = 50;
 
 // ── DOM refs ──
 const $ = (sel) => document.querySelector(sel);
@@ -19,6 +28,9 @@ const progressBar = $("#progressBar");
 const resultsArea = $("#resultsArea");
 const summaryBar = $("#summaryBar");
 const groupsContainer = $("#groupsContainer");
+const loadMoreArea = $("#loadMoreArea");
+const loadMoreBtn = $("#loadMoreBtn");
+const loadMoreInfo = $("#loadMoreInfo");
 
 // ── Scan ──
 scanBtn.addEventListener("click", startScan);
@@ -27,6 +39,7 @@ $("#autoSelectBtn").addEventListener("click", autoSelectNewer);
 $("#deselectBtn").addEventListener("click", deselectAll);
 $("#deleteBtn").addEventListener("click", showDeleteConfirm);
 $("#confirmDeleteBtn").addEventListener("click", doDelete);
+loadMoreBtn.addEventListener("click", loadMore);
 
 async function startScan() {
     const root = dirInput.value.trim();
@@ -36,9 +49,14 @@ async function startScan() {
     cancelBtn.disabled = false;
     progressArea.classList.remove("d-none");
     resultsArea.classList.add("d-none");
+    loadMoreArea.classList.add("d-none");
     groupsContainer.innerHTML = "";
-    scanGroups = [];
+    loadedGroupCount = 0;
+    totalGroupCount = 0;
+    summaryData = null;
     progressBar.style.width = "0%";
+    phaseLabel.textContent = "";
+    progressText.textContent = "";
 
     const body = {
         root,
@@ -86,8 +104,12 @@ function pollProgress(jobId) {
 
         if (d.status === "done") {
             eventSource.close();
-            scanGroups = d.groups || [];
-            renderResults(scanGroups);
+            summaryData = d.summary;
+            totalGroupCount = d.summary.group_count;
+            phaseLabel.textContent = `Done · ${totalGroupCount.toLocaleString()} duplicate groups`;
+            showSummary(d.summary);
+            // Load first page of groups
+            loadGroups(jobId, 0);
             scanBtn.disabled = false;
             cancelBtn.disabled = true;
         } else if (d.status === "error") {
@@ -113,43 +135,75 @@ async function cancelScan() {
     scanBtn.disabled = false;
 }
 
-// ── Render results ──
-function renderResults(groups) {
+// ── Summary ──
+function showSummary(s) {
     resultsArea.classList.remove("d-none");
-    groupsContainer.innerHTML = "";
-
-    let totalDupes = 0;
-    let totalWaste = 0;
-    for (const g of groups) {
-        totalDupes += g.files.length - 1;
-        for (let i = 1; i < g.files.length; i++) totalWaste += g.files[i].size;
-    }
-
     summaryBar.innerHTML = `
         <i class="bi bi-info-circle me-2"></i>
-        <strong>${groups.length}</strong>&nbsp;duplicate groups &nbsp;•&nbsp;
-        <strong>${totalDupes}</strong>&nbsp;duplicate files &nbsp;•&nbsp;
-        <strong>${humanSize(totalWaste)}</strong>&nbsp;reclaimable
+        <strong>${s.group_count.toLocaleString()}</strong>&nbsp;duplicate groups &nbsp;•&nbsp;
+        <strong>${s.file_count.toLocaleString()}</strong>&nbsp;duplicate files &nbsp;•&nbsp;
+        <strong>${s.reclaimable_h}</strong>&nbsp;reclaimable
     `;
+}
 
-    for (const g of groups) {
-        groupsContainer.appendChild(buildGroup(g));
+// ── Paginated group loading ──
+async function loadGroups(jobId, offset) {
+    try {
+        loadMoreBtn.disabled = true;
+        loadMoreBtn.innerHTML = `<span class="spinner-border spinner-border-sm me-1"></span> Loading…`;
+
+        const res = await fetch(`/api/scan/${jobId}/groups?offset=${offset}&limit=${PAGE_SIZE}`);
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+
+        for (const g of data.groups) {
+            const expand = loadedGroupCount < 3; // first 3 expanded
+            groupsContainer.appendChild(buildGroup(g, expand));
+            loadedGroupCount++;
+        }
+
+        // Update load-more area
+        if (data.has_more) {
+            const remaining = data.total - loadedGroupCount;
+            loadMoreArea.classList.remove("d-none");
+            loadMoreBtn.disabled = false;
+            loadMoreBtn.innerHTML = `<i class="bi bi-arrow-down-circle"></i> Load More`;
+            loadMoreInfo.textContent = `Showing ${loadedGroupCount.toLocaleString()} of ${data.total.toLocaleString()} groups (${remaining.toLocaleString()} remaining)`;
+        } else {
+            loadMoreArea.classList.add("d-none");
+            loadMoreInfo.textContent = "";
+        }
+    } catch (e) {
+        alert("Failed to load groups: " + e.message);
+        loadMoreBtn.disabled = false;
+        loadMoreBtn.innerHTML = `<i class="bi bi-arrow-down-circle"></i> Load More`;
     }
 }
 
-function buildGroup(group) {
+function loadMore() {
+    if (!currentJobId) return;
+    loadGroups(currentJobId, loadedGroupCount);
+}
+
+// ── Build a single group ──
+function buildGroup(group, expanded) {
     const div = document.createElement("div");
     div.className = "dup-group";
+    div.dataset.groupIndex = group.index;
 
     // Header
     const header = document.createElement("div");
     header.className = "dup-group-header";
     header.innerHTML = `
-        <i class="bi bi-chevron-down toggle-icon"></i>
+        <i class="bi ${expanded ? "bi-chevron-down" : "bi-chevron-right"} toggle-icon"></i>
         <span class="badge bg-secondary">${group.mode}</span>
-        Group ${group.index} &nbsp;–&nbsp; ${group.file_count} files &nbsp;•&nbsp; ${group.each_size_h} each
+        <span class="group-title">Group ${group.index} &nbsp;–&nbsp; ${group.file_count} files &nbsp;•&nbsp; ${group.each_size_h} each</span>
     `;
-    header.addEventListener("click", () => {
+
+    // Left-click: toggle expand/collapse
+    header.addEventListener("click", (e) => {
+        // Don't toggle if right-click handled
+        if (e.button !== 0) return;
         const body = div.querySelector(".dup-group-body");
         const icon = header.querySelector(".toggle-icon");
         if (body.style.display === "none") {
@@ -160,11 +214,20 @@ function buildGroup(group) {
             icon.className = "bi bi-chevron-right toggle-icon";
         }
     });
+
+    // Right-click on header: group context menu
+    header.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        showGroupContextMenu(e.clientX, e.clientY, div);
+    });
+
     div.appendChild(header);
 
     // Body table
     const body = document.createElement("div");
     body.className = "dup-group-body";
+    if (!expanded) body.style.display = "none";
 
     let html = `<table class="dup-table">
         <thead><tr>
@@ -209,19 +272,100 @@ function buildGroup(group) {
         });
     });
 
-    // Right-click context menu
+    // Right-click on file rows: file context menu
     body.addEventListener("contextmenu", (e) => {
         const tr = e.target.closest("tr[data-path]");
         if (!tr) return;
         e.preventDefault();
-        showContextMenu(e.clientX, e.clientY, tr);
+        showFileContextMenu(e.clientX, e.clientY, tr);
     });
 
     return div;
 }
 
-// ── Context menu ──
-function showContextMenu(x, y, tr) {
+// ── Group context menu (right-click on header) ──
+function showGroupContextMenu(x, y, groupDiv) {
+    removeContextMenu();
+
+    const menu = document.createElement("div");
+    menu.className = "ctx-menu";
+    menu.style.left = x + "px";
+    menu.style.top = y + "px";
+
+    // Mark ALL as DELETE
+    const delAll = menuItem("bi-trash3", "Mark ALL as DELETE", "text-danger");
+    delAll.addEventListener("click", () => {
+        setGroupAction(groupDiv, "delete");
+        removeContextMenu();
+    });
+    menu.appendChild(delAll);
+
+    // Mark ALL as KEEP
+    const keepAll = menuItem("bi-check-circle", "Mark ALL as KEEP", "text-success");
+    keepAll.addEventListener("click", () => {
+        setGroupAction(groupDiv, "keep");
+        removeContextMenu();
+    });
+    menu.appendChild(keepAll);
+
+    menu.appendChild(menuSep());
+
+    // Keep oldest, delete rest
+    const keepOldest = menuItem("bi-clock-history", "Keep oldest, delete rest", "text-warning");
+    keepOldest.addEventListener("click", () => {
+        setGroupKeepOldest(groupDiv);
+        removeContextMenu();
+    });
+    menu.appendChild(keepOldest);
+
+    menu.appendChild(menuSep());
+
+    // Expand / Collapse
+    const body = groupDiv.querySelector(".dup-group-body");
+    const isExpanded = body && body.style.display !== "none";
+    const toggleItem = menuItem(
+        isExpanded ? "bi-arrows-collapse" : "bi-arrows-expand",
+        isExpanded ? "Collapse group" : "Expand group"
+    );
+    toggleItem.addEventListener("click", () => {
+        const icon = groupDiv.querySelector(".toggle-icon");
+        if (isExpanded) {
+            body.style.display = "none";
+            icon.className = "bi bi-chevron-right toggle-icon";
+        } else {
+            body.style.display = "";
+            icon.className = "bi bi-chevron-down toggle-icon";
+        }
+        removeContextMenu();
+    });
+    menu.appendChild(toggleItem);
+
+    document.body.appendChild(menu);
+    adjustMenuPosition(menu);
+
+    setTimeout(() => {
+        document.addEventListener("click", removeContextMenu, { once: true });
+    }, 10);
+}
+
+function setGroupAction(groupDiv, action) {
+    const checks = groupDiv.querySelectorAll(".dup-check");
+    checks.forEach((cb) => {
+        cb.checked = action === "delete";
+        cb.dispatchEvent(new Event("change"));
+    });
+}
+
+function setGroupKeepOldest(groupDiv) {
+    const checks = groupDiv.querySelectorAll(".dup-check");
+    checks.forEach((cb, i) => {
+        cb.checked = i !== 0; // first = oldest = KEEP
+        cb.dispatchEvent(new Event("change"));
+    });
+}
+
+// ── File context menu (right-click on row) ──
+function showFileContextMenu(x, y, tr) {
     removeContextMenu();
     const path = tr.dataset.path;
     const cb = tr.querySelector(".dup-check");
@@ -231,7 +375,7 @@ function showContextMenu(x, y, tr) {
     menu.style.left = x + "px";
     menu.style.top = y + "px";
 
-    // Copy path
+    // Copy full path
     const copyItem = menuItem("bi-clipboard", "Copy full path");
     copyItem.addEventListener("click", () => {
         navigator.clipboard.writeText(path).catch(() => {});
@@ -266,20 +410,17 @@ function showContextMenu(x, y, tr) {
     }
 
     document.body.appendChild(menu);
-
-    // Adjust if off-screen
-    const rect = menu.getBoundingClientRect();
-    if (rect.right > window.innerWidth) menu.style.left = (window.innerWidth - rect.width - 8) + "px";
-    if (rect.bottom > window.innerHeight) menu.style.top = (window.innerHeight - rect.height - 8) + "px";
+    adjustMenuPosition(menu);
 
     setTimeout(() => {
         document.addEventListener("click", removeContextMenu, { once: true });
     }, 10);
 }
 
-function menuItem(icon, text) {
+// ── Context menu helpers ──
+function menuItem(icon, text, colorClass) {
     const d = document.createElement("div");
-    d.className = "ctx-menu-item";
+    d.className = "ctx-menu-item" + (colorClass ? " " + colorClass : "");
     d.innerHTML = `<i class="bi ${icon}"></i> ${text}`;
     return d;
 }
@@ -292,6 +433,12 @@ function menuSep() {
 
 function removeContextMenu() {
     document.querySelectorAll(".ctx-menu").forEach((m) => m.remove());
+}
+
+function adjustMenuPosition(menu) {
+    const rect = menu.getBoundingClientRect();
+    if (rect.right > window.innerWidth) menu.style.left = (window.innerWidth - rect.width - 8) + "px";
+    if (rect.bottom > window.innerHeight) menu.style.top = (window.innerHeight - rect.height - 8) + "px";
 }
 
 // ── Bulk actions ──
@@ -323,7 +470,7 @@ function showDeleteConfirm() {
     });
 
     $("#deleteMsg").innerHTML = `
-        Permanently delete <strong>${paths.length}</strong> file(s)?<br>
+        Permanently delete <strong>${paths.length.toLocaleString()}</strong> file(s)?<br>
         This will free approximately <strong>${humanSize(totalSize)}</strong>.
     `;
     new bootstrap.Modal($("#deleteModal")).show();
@@ -332,6 +479,11 @@ function showDeleteConfirm() {
 async function doDelete() {
     const paths = getSelectedPaths();
     bootstrap.Modal.getInstance($("#deleteModal")).hide();
+
+    // Show progress
+    const btn = $("#deleteBtn");
+    btn.disabled = true;
+    btn.innerHTML = `<span class="spinner-border spinner-border-sm me-1"></span> Deleting…`;
 
     try {
         const res = await fetch("/api/delete", {
@@ -360,6 +512,9 @@ async function doDelete() {
         alert(msg);
     } catch (e) {
         alert("Delete failed: " + e.message);
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = `<i class="bi bi-trash3"></i> Delete Selected`;
     }
 }
 

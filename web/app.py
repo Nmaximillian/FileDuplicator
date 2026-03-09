@@ -1,7 +1,8 @@
 """
-File Duplicator – Web edition.
+File Duplicator – Web edition (v2).
 
 Flask server that wraps the scanner engine and exposes a REST API + SSE progress.
+Groups are stored server-side and served paginated to avoid browser crashes.
 """
 
 from __future__ import annotations
@@ -25,6 +26,8 @@ app.secret_key = os.urandom(24)
 # In-memory store for scan jobs (single-user NAS tool – fine for this use-case)
 _jobs: dict[str, dict] = {}
 _jobs_lock = threading.Lock()
+
+PAGE_SIZE = 50  # groups per page
 
 
 def _human_size(n: int | float) -> str:
@@ -87,7 +90,8 @@ def api_scan_start():
         "phase": "",
         "current": 0,
         "total": 0,
-        "groups": [],
+        "groups": [],          # serialised, sorted, pageable
+        "summary": {},
         "error": None,
         "cancelled": False,
     }
@@ -122,7 +126,31 @@ def api_scan_start():
                 progress=_progress,
                 cancelled=lambda: job["cancelled"],
             )
-            job["groups"] = _serialise_groups(groups)
+
+            # Serialise and sort by file size descending (biggest dupes first)
+            serialised = _serialise_groups(groups)
+            serialised.sort(
+                key=lambda g: g["files"][0]["size"] if g["files"] else 0,
+                reverse=True,
+            )
+            # Re-number after sort
+            for i, g in enumerate(serialised):
+                g["index"] = i + 1
+
+            # Pre-compute summary
+            total_files = sum(g["file_count"] for g in serialised)
+            total_waste = 0
+            for g in serialised:
+                for f in g["files"][1:]:
+                    total_waste += f["size"]
+
+            job["groups"] = serialised
+            job["summary"] = {
+                "group_count": len(serialised),
+                "file_count": total_files,
+                "reclaimable": total_waste,
+                "reclaimable_h": _human_size(total_waste),
+            }
             job["status"] = "done"
         except Exception as exc:
             job["error"] = str(exc)
@@ -135,7 +163,7 @@ def api_scan_start():
 
 @app.route("/api/scan/<job_id>/progress")
 def api_scan_progress(job_id: str):
-    """SSE stream of scan progress."""
+    """SSE stream of scan progress.  On completion sends summary only (not all groups)."""
     def generate():
         import time
         while True:
@@ -152,7 +180,8 @@ def api_scan_progress(job_id: str):
                 "total": job["total"],
             }
             if job["status"] == "done":
-                payload["groups"] = job["groups"]
+                # Only send summary – groups are fetched via paginated API
+                payload["summary"] = job["summary"]
                 yield f"data: {json.dumps(payload)}\n\n"
                 return
             if job["status"] == "error":
@@ -168,6 +197,30 @@ def api_scan_progress(job_id: str):
         mimetype="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.route("/api/scan/<job_id>/groups")
+def api_scan_groups(job_id: str):
+    """Paginated group results.  ?offset=0&limit=50"""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "unknown job"}), 404
+    if job["status"] != "done":
+        return jsonify({"error": "scan not complete"}), 400
+
+    offset = request.args.get("offset", 0, type=int)
+    limit = request.args.get("limit", PAGE_SIZE, type=int)
+    limit = min(limit, 200)  # cap max per request
+
+    groups = job["groups"]
+    page = groups[offset: offset + limit]
+    return jsonify({
+        "groups": page,
+        "total": len(groups),
+        "offset": offset,
+        "has_more": (offset + limit) < len(groups),
+    })
 
 
 @app.route("/api/scan/<job_id>/cancel", methods=["POST"])

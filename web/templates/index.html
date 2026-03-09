@@ -25,7 +25,7 @@
         <div class="card-body py-2">
             <label class="form-label fw-bold mb-1">Directory</label>
             <div class="input-group">
-                <input id="dirInput" type="text" class="form-control" placeholder="/volume1/data">
+                <input id="dirInput" type="text" class="form-control" placeholder="/data/NickRoot">
                 <button id="browseBtn" class="btn btn-outline-secondary" type="button">
                     <i class="bi bi-folder2-open"></i> Browse
                 </button>
@@ -97,13 +97,16 @@
         <div id="summaryBar" class="alert alert-info d-flex align-items-center mb-3 py-2"></div>
 
         <!-- Bulk actions -->
-        <div class="d-flex gap-2 mb-2 flex-wrap">
+        <div class="d-flex gap-2 mb-2 flex-wrap align-items-center">
             <button id="autoSelectBtn" class="btn btn-sm btn-outline-warning">
                 <i class="bi bi-check2-all"></i> Select All Newer as Delete
             </button>
             <button id="deselectBtn" class="btn btn-sm btn-outline-secondary">
                 <i class="bi bi-x-circle"></i> Deselect All
             </button>
+            <span class="text-muted small ms-2">
+                <i class="bi bi-mouse"></i> Right-click group headers for bulk actions
+            </span>
             <div class="ms-auto">
                 <button id="deleteBtn" class="btn btn-sm btn-danger fw-bold">
                     <i class="bi bi-trash3"></i> Delete Selected
@@ -113,6 +116,14 @@
 
         <!-- Groups container -->
         <div id="groupsContainer"></div>
+
+        <!-- Load more -->
+        <div id="loadMoreArea" class="text-center py-3 d-none">
+            <button id="loadMoreBtn" class="btn btn-outline-primary mb-2">
+                <i class="bi bi-arrow-down-circle"></i> Load More
+            </button>
+            <div id="loadMoreInfo" class="text-muted small"></div>
+        </div>
     </div>
 </div>
 
