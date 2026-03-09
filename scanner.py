@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import os
 import stat
-import hashlib
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -26,7 +25,22 @@ import xxhash
 # Constants
 # ---------------------------------------------------------------------------
 PARTIAL_CHUNK = 64 * 1024        # 64 KB for partial hash
-FULL_CHUNK    = 1 * 1024 * 1024  # 1 MB read buffer for full hash
+FULL_CHUNK    = 4 * 1024 * 1024  # 4 MB read buffer for full hash (larger = fewer syscalls)
+
+# Directories to always skip (case-insensitive on Windows)
+SKIP_DIRS: set[str] = {
+    "$recycle.bin", "system volume information", "$windows.~bt",
+    "$windows.~ws", "windows", "windows.old",
+    "recovery", "config.msi", "msocache",
+    ".git", ".hg", ".svn", "node_modules", "__pycache__",
+    ".tox", ".nox", ".mypy_cache", ".pytest_cache",
+    ".venv", "venv", "env",
+}
+
+# File extensions to always skip (temp / OS junk)
+SKIP_EXTENSIONS: set[str] = {
+    ".tmp", ".temp", ".log", ".bak",
+}
 
 
 class DuplicateMode(Enum):
@@ -35,7 +49,7 @@ class DuplicateMode(Enum):
     HASH = auto()
 
 
-@dataclass
+@dataclass(slots=True)
 class FileEntry:
     path: str
     name: str
@@ -85,6 +99,43 @@ def _full_hash(path: str) -> str:
         return ""
 
 
+def _walk_fast(root: str, min_size: int, skip_dirs: set[str],
+               cancelled: CancelCheck, progress: ProgressCallback) -> list[FileEntry]:
+    """Walk directory tree using os.scandir for speed, with directory filtering."""
+    all_files: list[FileEntry] = []
+    count = 0
+    dirs_to_walk = [root]
+
+    while dirs_to_walk:
+        if cancelled():
+            return []
+        current = dirs_to_walk.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            if entry.name.lower() not in skip_dirs:
+                                dirs_to_walk.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            st = entry.stat(follow_symlinks=False)
+                            if st.st_size >= min_size:
+                                all_files.append(FileEntry(
+                                    path=entry.path,
+                                    name=entry.name,
+                                    size=st.st_size,
+                                ))
+                                count += 1
+                                if count % 10000 == 0:
+                                    progress("Enumerating files…", count, 0)
+                    except (OSError, PermissionError):
+                        continue
+        except (OSError, PermissionError):
+            continue
+
+    return all_files
+
+
 def scan_directory(
     root: str,
     *,
@@ -95,6 +146,7 @@ def scan_directory(
     min_size: int = 1,
     progress: ProgressCallback | None = None,
     cancelled: CancelCheck | None = None,
+    extra_skip_dirs: set[str] | None = None,
 ) -> list[DuplicateGroup]:
     """
     Scan *root* for duplicate files.
@@ -117,6 +169,8 @@ def scan_directory(
         ``(phase, current, total)`` – called periodically.
     cancelled : callable, optional
         Return ``True`` to abort early.
+    extra_skip_dirs : set[str], optional
+        Additional directory names to skip (lowercase).
 
     Returns
     -------
@@ -124,42 +178,32 @@ def scan_directory(
     """
     _progress = progress or (lambda *_: None)
     _cancelled = cancelled or (lambda: False)
+    skip = SKIP_DIRS | (extra_skip_dirs or set())
 
     # ------------------------------------------------------------------
-    # Phase 1 – enumerate files
+    # Phase 1 – enumerate files (using fast os.scandir walker)
     # ------------------------------------------------------------------
     _progress("Enumerating files…", 0, 0)
-    all_files: list[FileEntry] = []
 
     if recursive:
-        for dirpath, _dirs, filenames in os.walk(root):
-            if _cancelled():
-                return []
-            for fn in filenames:
-                fp = os.path.join(dirpath, fn)
-                try:
-                    st = os.stat(fp)
-                    if not stat.S_ISREG(st.st_mode):
-                        continue
-                    if st.st_size < min_size:
-                        continue
-                    all_files.append(FileEntry(path=fp, name=fn, size=st.st_size))
-                except (OSError, PermissionError):
-                    continue
+        all_files = _walk_fast(root, min_size, skip, _cancelled, _progress)
     else:
-        for fn in os.listdir(root):
-            if _cancelled():
-                return []
-            fp = os.path.join(root, fn)
-            try:
-                st = os.stat(fp)
-                if not stat.S_ISREG(st.st_mode):
-                    continue
-                if st.st_size < min_size:
-                    continue
-                all_files.append(FileEntry(path=fp, name=fn, size=st.st_size))
-            except (OSError, PermissionError):
-                continue
+        all_files = []
+        try:
+            with os.scandir(root) as it:
+                for entry in it:
+                    if _cancelled():
+                        return []
+                    try:
+                        if entry.is_file(follow_symlinks=False):
+                            st = entry.stat(follow_symlinks=False)
+                            if st.st_size >= min_size:
+                                all_files.append(FileEntry(
+                                    path=entry.path, name=entry.name, size=st.st_size))
+                    except (OSError, PermissionError):
+                        continue
+        except (OSError, PermissionError):
+            pass
 
     total_files = len(all_files)
     _progress("Enumerating files…", total_files, total_files)
@@ -177,7 +221,7 @@ def scan_directory(
         name_map: dict[str, list[FileEntry]] = defaultdict(list)
         for i, fe in enumerate(all_files):
             name_map[fe.name.lower()].append(fe)
-            if i % 5000 == 0:
+            if i % 50000 == 0:
                 _progress("Grouping by name…", i, total_files)
                 if _cancelled():
                     return []
@@ -194,15 +238,12 @@ def scan_directory(
     # ------------------------------------------------------------------
     _progress("Grouping by size…", 0, total_files)
     size_map: dict[int, list[FileEntry]] = defaultdict(list)
-    for i, fe in enumerate(all_files):
+    for fe in all_files:
         size_map[fe.size].append(fe)
-        if i % 5000 == 0:
-            _progress("Grouping by size…", i, total_files)
-            if _cancelled():
-                return []
 
     # Keep only groups with 2+ files
     size_groups = {sz: grp for sz, grp in size_map.items() if len(grp) >= 2}
+    del size_map  # free memory
     _progress("Grouping by size…", total_files, total_files)
 
     if not by_hash:
@@ -216,9 +257,12 @@ def scan_directory(
     # Phase 4 – partial hash (fast pre-filter)
     # ------------------------------------------------------------------
     candidates = [fe for grp in size_groups.values() for fe in grp]
+    del size_groups  # free memory
     total_candidates = len(candidates)
     _progress("Partial hashing…", 0, total_candidates)
 
+    # Sort by size descending – hash small files quickly first is nice,
+    # but grouping by size improves OS I/O scheduling
     partial_map: dict[str, list[FileEntry]] = defaultdict(list)
     for i, fe in enumerate(candidates):
         if _cancelled():
@@ -227,16 +271,24 @@ def scan_directory(
         if fe.partial_hash:
             key = f"{fe.size}:{fe.partial_hash}"
             partial_map[key].append(fe)
-        if i % 200 == 0:
+        if i % 2000 == 0:
             _progress("Partial hashing…", i, total_candidates)
 
+    del candidates  # free memory
     partial_groups = {k: g for k, g in partial_map.items() if len(g) >= 2}
+    del partial_map
     _progress("Partial hashing…", total_candidates, total_candidates)
 
     # ------------------------------------------------------------------
     # Phase 5 – full hash (only for partial-hash collisions)
+    # Sort by size ascending so small files resolve quickly and progress
+    # moves fast at the start.
     # ------------------------------------------------------------------
-    full_candidates = [fe for grp in partial_groups.values() for fe in grp]
+    full_candidates = sorted(
+        [fe for grp in partial_groups.values() for fe in grp],
+        key=lambda fe: fe.size,
+    )
+    del partial_groups
     total_full = len(full_candidates)
     _progress("Full hashing…", 0, total_full)
 
@@ -248,12 +300,15 @@ def scan_directory(
         if fe.full_hash:
             key = f"{fe.size}:{fe.full_hash}"
             full_map[key].append(fe)
-        if i % 50 == 0:
+        if i % 200 == 0:
             _progress("Full hashing…", i, total_full)
 
     for key, grp in full_map.items():
         if len(grp) >= 2:
             results.append(DuplicateGroup(DuplicateMode.HASH, key, grp))
+
+    # Sort result groups by total wasted space (largest first)
+    results.sort(key=lambda g: g.files[0].size * (len(g.files) - 1), reverse=True)
 
     _progress("Done", total_full, total_full)
     return results

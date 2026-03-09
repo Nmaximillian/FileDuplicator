@@ -13,6 +13,7 @@ from pathlib import Path
 from PyQt6.QtCore import (
     Qt,
     QThread,
+    QTimer,
     pyqtSignal,
     pyqtSlot,
     QSettings,
@@ -374,7 +375,7 @@ class MainWindow(QMainWindow):
         self._scan_btn.setEnabled(True)
         self._cancel_btn.setEnabled(False)
         self._groups = groups
-        self._populate_tree(groups)
+
         total_dupes = sum(len(g.files) - 1 for g in groups)
         total_waste = sum(
             sum(f.size for f in g.files[1:]) for g in groups
@@ -385,8 +386,13 @@ class MainWindow(QMainWindow):
             f"{_human_size(total_waste)} reclaimable"
         )
         self._progress.setValue(self._progress.maximum() or 1)
-        self._phase_label.setText("Scan complete.")
+        self._phase_label.setText(
+            f"Scan complete – loading results… ({len(groups)} groups)"
+        )
         self._status.showMessage(f"Scan complete – {len(groups)} groups found.", 10_000)
+
+        # Start batched population (won't freeze the UI)
+        self._start_batched_populate(groups)
 
     @pyqtSlot(str)
     def _on_error(self, msg: str):
@@ -394,55 +400,94 @@ class MainWindow(QMainWindow):
         self._cancel_btn.setEnabled(False)
         QMessageBox.critical(self, "Scan error", msg)
 
-    # ----- Tree population --------------------------------------------------
-    def _populate_tree(self, groups: list[DuplicateGroup]):
+    # ----- Batched tree population (non-blocking) ---------------------------
+    BATCH_SIZE = 50   # groups per batch
+    BATCH_DELAY = 10  # ms between batches – enough to keep UI responsive
+
+    def _start_batched_populate(self, groups: list[DuplicateGroup]):
+        """Populate the tree in small batches via QTimer so the UI never freezes."""
         self._tree.clear()
+
+        # Disconnect any previous itemChanged connections to avoid duplicate slots
+        try:
+            self._tree.itemChanged.disconnect(self._on_item_changed)
+        except TypeError:
+            pass
+
+        # Block signals while bulk-inserting (huge speedup)
+        self._tree.blockSignals(True)
         self._tree.setUpdatesEnabled(False)
 
-        for idx, grp in enumerate(groups):
-            color = GROUP_COLORS[idx % len(GROUP_COLORS)]
-            mode_label = grp.mode.name.capitalize()
+        self._pending_groups = groups
+        self._batch_index = 0
 
-            group_item = QTreeWidgetItem(self._tree)
-            group_item.setText(
-                1,
-                f"[{mode_label}] Group {idx + 1}  –  "
-                f"{len(grp.files)} files  •  {_human_size(grp.files[0].size)} each",
-            )
-            group_item.setExpanded(True)
-            group_item.setFirstColumnSpanned(False)
+        self._batch_timer = QTimer(self)
+        self._batch_timer.setInterval(self.BATCH_DELAY)
+        self._batch_timer.timeout.connect(self._populate_next_batch)
+        self._batch_timer.start()
+
+    def _populate_next_batch(self):
+        """Add the next BATCH_SIZE groups to the tree."""
+        groups = self._pending_groups
+        start = self._batch_index
+        end = min(start + self.BATCH_SIZE, len(groups))
+
+        for idx in range(start, end):
+            grp = groups[idx]
+            self._add_group_to_tree(idx, grp)
+
+        self._batch_index = end
+        self._phase_label.setText(
+            f"Loading results… {end}/{len(groups)} groups"
+        )
+
+        if end >= len(groups):
+            # All done
+            self._batch_timer.stop()
+            self._tree.setUpdatesEnabled(True)
+            self._tree.blockSignals(False)
+            self._tree.itemChanged.connect(self._on_item_changed)
+            self._phase_label.setText("Scan complete.")
+            self._pending_groups = []
+
+    def _add_group_to_tree(self, idx: int, grp: DuplicateGroup):
+        """Add a single group + its file children to the tree."""
+        color = GROUP_COLORS[idx % len(GROUP_COLORS)]
+        mode_label = grp.mode.name.capitalize()
+
+        group_item = QTreeWidgetItem(self._tree)
+        group_item.setText(
+            1,
+            f"[{mode_label}] Group {idx + 1}  –  "
+            f"{len(grp.files)} files  •  {_human_size(grp.files[0].size)} each",
+        )
+        group_item.setExpanded(True)
+        group_item.setFirstColumnSpanned(False)
+        for col in range(5):
+            group_item.setBackground(col, color)
+            group_item.setForeground(col, GROUP_HEADER_COLOR)
+
+        # Sort files: oldest first (so first = "original")
+        sorted_files = sorted(grp.files, key=lambda f: _safe_mtime(f.path))
+
+        for fi, fe in enumerate(sorted_files):
+            child = QTreeWidgetItem(group_item)
+            child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            if fi == 0:
+                child.setCheckState(0, Qt.CheckState.Unchecked)
+                child.setText(0, "KEEP")
+            else:
+                child.setCheckState(0, Qt.CheckState.Checked)
+                child.setText(0, "DELETE")
+            child.setText(1, fe.name)
+            child.setText(2, fe.path)
+            child.setText(3, _human_size(fe.size))
+            child.setText(4, fe.full_hash[:12] if fe.full_hash else fe.partial_hash[:12] if fe.partial_hash else "")
+            child.setData(0, Qt.ItemDataRole.UserRole, fe.path)
             for col in range(5):
-                group_item.setBackground(col, color)
-                group_item.setForeground(col, GROUP_HEADER_COLOR)
-
-            # Sort files: oldest first (so first = "original")
-            sorted_files = sorted(grp.files, key=lambda f: _safe_mtime(f.path))
-
-            for fi, fe in enumerate(sorted_files):
-                child = QTreeWidgetItem(group_item)
-                child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                # First file defaults to KEEP, rest default to DELETE
-                if fi == 0:
-                    child.setCheckState(0, Qt.CheckState.Unchecked)
-                    child.setText(0, "KEEP")
-                else:
-                    child.setCheckState(0, Qt.CheckState.Checked)
-                    child.setText(0, "DELETE")
-                child.setText(1, fe.name)
-                child.setText(2, fe.path)
-                child.setText(3, _human_size(fe.size))
-                child.setText(4, fe.full_hash[:12] if fe.full_hash else fe.partial_hash[:12] if fe.partial_hash else "")
-                child.setData(0, Qt.ItemDataRole.UserRole, fe.path)
-                for col in range(5):
-                    child.setBackground(col, color)
-                    child.setForeground(col, TEXT_COLOR_LIGHT)
-                # Highlight the action label
-                child.setForeground(0, TEXT_COLOR_KEEP if fi == 0 else TEXT_COLOR_DEL)
-
-        self._tree.setUpdatesEnabled(True)
-
-        # Update check-state labels when user toggles
-        self._tree.itemChanged.connect(self._on_item_changed)
+                child.setBackground(col, color)
+                child.setForeground(col, TEXT_COLOR_LIGHT)
+            child.setForeground(0, TEXT_COLOR_KEEP if fi == 0 else TEXT_COLOR_DEL)
 
     def _on_item_changed(self, item: QTreeWidgetItem, column: int):
         if column == 0 and item.parent() is not None:
@@ -496,6 +541,7 @@ class MainWindow(QMainWindow):
     # ----- Bulk selection helpers -------------------------------------------
     def _auto_select_newer(self):
         """Mark all but the oldest file in each group for deletion."""
+        self._tree.blockSignals(True)
         root = self._tree.invisibleRootItem()
         for gi in range(root.childCount()):
             group_item = root.child(gi)
@@ -503,15 +549,25 @@ class MainWindow(QMainWindow):
                 child = group_item.child(ci)
                 if ci == 0:
                     child.setCheckState(0, Qt.CheckState.Unchecked)
+                    child.setText(0, "KEEP")
+                    child.setForeground(0, TEXT_COLOR_KEEP)
                 else:
                     child.setCheckState(0, Qt.CheckState.Checked)
+                    child.setText(0, "DELETE")
+                    child.setForeground(0, TEXT_COLOR_DEL)
+        self._tree.blockSignals(False)
 
     def _deselect_all(self):
+        self._tree.blockSignals(True)
         root = self._tree.invisibleRootItem()
         for gi in range(root.childCount()):
             group_item = root.child(gi)
             for ci in range(group_item.childCount()):
-                group_item.child(ci).setCheckState(0, Qt.CheckState.Unchecked)
+                child = group_item.child(ci)
+                child.setCheckState(0, Qt.CheckState.Unchecked)
+                child.setText(0, "KEEP")
+                child.setForeground(0, TEXT_COLOR_KEEP)
+        self._tree.blockSignals(False)
 
     # ----- Deletion ---------------------------------------------------------
     def _delete_selected(self):
