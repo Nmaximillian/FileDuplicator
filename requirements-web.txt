@@ -1,0 +1,4 @@
+# Web edition dependencies
+flask>=3.0
+gunicorn>=22.0
+xxhash>=3.4

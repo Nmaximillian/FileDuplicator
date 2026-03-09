@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect x="16" y="6" width="30" height="38" rx="4" fill="#3c6e8f" stroke="#6ab0e0" stroke-width="2"/>
+  <rect x="10" y="14" width="30" height="38" rx="4" fill="#1e3a5f" stroke="#508ec0" stroke-width="2"/>
+  <line x1="16" y1="24" x2="34" y2="24" stroke="#8cc4f0" stroke-width="2" stroke-linecap="round"/>
+  <line x1="16" y1="30" x2="30" y2="30" stroke="#8cc4f0" stroke-width="2" stroke-linecap="round"/>
+  <line x1="16" y1="36" x2="28" y2="36" stroke="#8cc4f0" stroke-width="2" stroke-linecap="round"/>
+  <circle cx="46" cy="46" r="12" fill="#142840" stroke="#64c8ff" stroke-width="3"/>
+  <line x1="54" y1="54" x2="62" y2="62" stroke="#64c8ff" stroke-width="3" stroke-linecap="round"/>
+</svg>

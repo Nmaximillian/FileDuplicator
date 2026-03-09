@@ -1,37 +1,68 @@
 # File Duplicator – Duplicate Finder
 
-A fast, standalone desktop app to find and remove duplicate files across large directory trees — tested with 8 TB+ / thousands of files.
+A fast duplicate-file scanner and cleaner for large directory trees (8 TB+). Available as a **Windows desktop app** or a **web UI** you can run on a NAS via Docker.
 
-![Python](https://img.shields.io/badge/Python-3.10+-blue) ![PyQt6](https://img.shields.io/badge/UI-PyQt6-green) ![xxhash](https://img.shields.io/badge/hash-xxhash-orange)
+![Python](https://img.shields.io/badge/Python-3.10+-blue) ![PyQt6](https://img.shields.io/badge/Desktop-PyQt6-green) ![Flask](https://img.shields.io/badge/Web-Flask-lightgrey) ![Docker](https://img.shields.io/badge/NAS-Docker-blue) ![xxhash](https://img.shields.io/badge/hash-xxhash-orange)
+
+---
 
 ## Running the App
 
-### Option A – Standalone executable (no Python needed)
-Download or build `dist\FileDuplicator.exe` and double-click it. No installation required.
+### Option A – Windows desktop (`.exe`)
+Download or build `dist\FileDuplicator.exe` and double-click it. No Python needed.
 
-### Option B – Run from source
+### Option B – Desktop from source
 ```bash
-# 1. Create & activate a virtual environment
 python -m venv .venv
+# Windows:  .\.venv\Scripts\activate
+# Linux:    source .venv/bin/activate
 
-# Windows
-.\.venv\Scripts\activate
-# macOS / Linux
-source .venv/bin/activate
-
-# 2. Install dependencies
 pip install -r requirements.txt
-
-# 3. Run
 python main.py
 ```
 
-### Building the executable yourself
+### Option C – Web UI (local)
+```bash
+pip install -r requirements-web.txt
+python -m web.app --port 5000
+# Open http://localhost:5000
+```
+
+### Option D – Docker on your NAS (recommended for Asustor / Synology / etc.)
+
+```bash
+# 1. Build the image
+docker compose build
+
+# 2. Edit docker-compose.yml to mount your NAS volumes (see below)
+
+# 3. Start
+docker compose up -d
+
+# Open http://<nas-ip>:5000
+```
+
+#### Volume mapping for Asustor Flashstor 12 Pro
+
+Edit `docker-compose.yml` and adjust the `volumes:` section:
+
+```yaml
+volumes:
+  # <host path on NAS>:<path inside container>
+  - /volume1:/data/volume1
+  - /volume2:/data/volume2
+```
+
+Inside the web UI, browse to `/data/volume1/...` to scan your files.
+
+> **Tip:** You can also deploy via **Portainer** (available in ADM's App Central).
+> Import the `docker-compose.yml` as a Stack.
+
+### Building the Windows executable
 ```bash
 pip install pyinstaller
 pyinstaller --onefile --windowed --name "FileDuplicator" \
   --icon "FileDuplicator.ico" --add-data "FileDuplicator.ico;." main.py
-# Output: dist\FileDuplicator.exe
 ```
 
 ---
@@ -41,30 +72,31 @@ pyinstaller --onefile --windowed --name "FileDuplicator" \
 ### Duplicate Detection
 - **Three match criteria** – file name, size, and/or content hash (combinable)
 - **Recursive or flat scan** – choose whether to walk subdirectories
-- **Minimum file size filter** – skip tiny files (0 B → 1 GB threshold, configurable)
+- **Minimum file size filter** – skip tiny files (0 B → 1 GB threshold)
 
 ### Performance (designed for 8 TB+)
-- **Progressive hashing** – groups by size → partial hash (first+last 64 KB) → full hash only on true collisions. Reads a tiny fraction of total disk data in most cases.
-- **xxhash (xxh128)** – ~10× faster than MD5/SHA for content hashing
-- **Threaded scanning** – background worker thread keeps the UI fully responsive during long scans with a live progress bar
+- **Progressive hashing** – groups by size → partial hash (first+last 64 KB) → full hash only on true collisions
+- **xxhash (xxh128)** – ~10× faster than MD5/SHA
+- **Background scanning** – UI stays responsive (desktop: QThread, web: SSE streaming)
 
-### Results & Navigation
-- **Color-coded groups** – each duplicate group has a distinct background; KEEP labels are green, DELETE labels are red
-- **Double-click** any file row → opens Windows Explorer with that exact file selected
-- **Right-click** any file row → context menu:
-  - 📂 Show in Explorer (selects the file)
-  - 📁 Open containing folder
-  - Toggle Mark as KEEP / DELETE
-
-### Deletion Workflow
-- **Automatic suggestions** – oldest file in each group is kept by default; newer copies are marked for deletion
-- **"Select All Newer as Delete"** bulk action
-- **Confirmation dialog** – shows exact file count and reclaimable space before any files are touched
-- **Permanent deletion** with per-file error reporting
-
-### Other
-- **Custom icon** – shown in the title bar, taskbar, and Windows Explorer
+### Desktop-only features
+- **Double-click** a file → opens Explorer with file selected
+- **Right-click context menu** → Show in Explorer / Open folder / Toggle KEEP-DELETE
+- **Custom `.ico` icon** in title bar, taskbar, and `.exe`
 - **Remembers last directory** between sessions
+
+### Web-only features
+- **Browser-based directory picker** – navigate your NAS shares visually
+- **Right-click context menu** → Copy full path / Copy directory / Toggle KEEP-DELETE
+- **Responsive dark theme** – works on desktop browsers, tablets, and phones
+- **Runs headless** – no display server needed (perfect for NAS)
+
+### Both editions
+- **Color-coded duplicate groups** – KEEP in green, DELETE in red
+- **Automatic suggestions** – oldest file kept, newer copies marked for deletion
+- **Bulk actions** – "Select All Newer as Delete" / "Deselect All"
+- **Confirmation dialog** – shows file count and reclaimable space before deletion
+- **Per-file error reporting** after deletion
 
 ---
 
@@ -73,22 +105,36 @@ pyinstaller --onefile --windowed --name "FileDuplicator" \
 | Phase | What happens | Disk reads |
 |---|---|---|
 | 1. Enumerate | `os.walk()` collects file name + size from metadata | None |
-| 2. Group by size | Files with a unique size are discarded immediately | None |
-| 3. Partial hash | First + last 64 KB read via xxhash | Tiny |
-| 4. Full hash | Only files still colliding after phase 3 are fully hashed (1 MB chunks) | Minimal |
+| 2. Group by size | Files with a unique size are discarded | None |
+| 3. Partial hash | First + last 64 KB hashed via xxhash | Tiny |
+| 4. Full hash | Only true collisions fully hashed (1 MB chunks) | Minimal |
 
-For a typical 8 TB drive, phases 3 and 4 together usually read well under 1% of total data.
+For a typical 8 TB drive, this reads well under 1% of total data.
 
 ---
 
 ## Project Structure
 
-| File | Purpose |
-|---|---|
-| `main.py` | App entry point – creates the QApplication and launches the window |
-| `main_window.py` | Full PyQt6 UI: directory picker, scan options, results tree, context menus, delete actions |
-| `scanner.py` | Core scan engine with 4-phase progressive hashing strategy |
-| `generate_icon.py` | Script to regenerate `FileDuplicator.ico` using Pillow |
-| `requirements.txt` | Runtime dependencies (`PyQt6`, `xxhash`) |
-| `FileDuplicator.ico` | App icon (all standard sizes, 16–256 px) |
-| `dist/FileDuplicator.exe` | Standalone Windows executable (built by PyInstaller) |
+```
+FileDuplicator/
+├── main.py                  # Desktop entry point (PyQt6)
+├── main_window.py           # Desktop UI
+├── scanner.py               # Core scan engine (shared by both editions)
+├── requirements.txt         # Desktop dependencies (PyQt6, xxhash)
+├── requirements-web.txt     # Web dependencies (Flask, gunicorn, xxhash)
+├── FileDuplicator.ico       # App icon
+├── generate_icon.py         # Regenerate the .ico via Pillow
+├── web/
+│   ├── app.py               # Flask server + REST API
+│   ├── templates/
+│   │   └── index.html       # Web UI page
+│   └── static/
+│       ├── app.js           # Client-side logic
+│       ├── style.css         # Dark theme styles
+│       └── favicon.svg       # Browser tab icon
+├── Dockerfile               # Docker image build
+├── docker-compose.yml       # One-command deploy with volume mounts
+├── .dockerignore
+└── dist/
+    └── FileDuplicator.exe   # Windows standalone (PyInstaller)
+```

@@ -1,0 +1,22 @@
+version: "3.8"
+
+services:
+  file-duplicator:
+    build: .
+    container_name: file-duplicator
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    volumes:
+      # Mount your NAS data volumes here (read-write so it can delete).
+      # Adjust the left side to match your Asustor share paths.
+      #
+      # Examples for Asustor ADM:
+      - /volume1:/data/volume1
+      # - /volume2:/data/volume2
+      #
+      # Or mount a specific share:
+      # - /volume1/Public:/data/Public
+      # - /volume1/Photos:/data/Photos
+    environment:
+      - TZ=UTC   # Set your timezone, e.g. America/New_York
