@@ -12,5 +12,5 @@ COPY web/ web/
 
 EXPOSE 5000
 
-# Run with gunicorn for production
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--threads", "4", "--timeout", "0", "web.app:app"]
+# Run with gunicorn – single worker with threads (job state is in-memory)
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--threads", "8", "--timeout", "0", "web.app:app"]
