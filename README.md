@@ -135,6 +135,19 @@ FileDuplicator/
 ├── Dockerfile               # Docker image build
 ├── docker-compose.yml       # One-command deploy with volume mounts
 ├── .dockerignore
+├── LICENSE                  # CC BY-NC-SA 4.0 (non-commercial)
 └── dist/
     └── FileDuplicator.exe   # Windows standalone (PyInstaller)
 ```
+
+---
+
+## License
+
+This project is licensed under **Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0)**.
+
+- ✅ **Free for personal, educational, and hobby use**
+- ❌ **Commercial use prohibited** without permission
+- 📄 See [LICENSE](LICENSE) file or visit https://creativecommons.org/licenses/by-nc-sa/4.0/
+
+For commercial licensing inquiries, please contact the project maintainers.
