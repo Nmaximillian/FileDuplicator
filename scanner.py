@@ -22,6 +22,7 @@ from enum import Enum, auto
 from typing import Callable
 
 import xxhash
+import hashlib
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -79,6 +80,20 @@ class DuplicateGroup:
     files: list[FileEntry] = field(default_factory=list)
 
 
+@dataclass
+class ScanStats:
+    """Statistics about a completed scan."""
+    total_files_scanned: int = 0
+    total_size_scanned: int = 0       # bytes
+    cloud_files_skipped: int = 0
+    size_groups: int = 0
+    partial_groups: int = 0
+    duplicate_groups: int = 0
+    duplicate_files: int = 0
+    reclaimable_bytes: int = 0
+    hash_algorithm: str = "xxhash"
+
+
 # Callback types
 ProgressCallback = Callable[[str, int, int], None]
 CancelCheck = Callable[[], bool]
@@ -88,31 +103,40 @@ CancelCheck = Callable[[], bool]
 # Hashing helpers
 # ---------------------------------------------------------------------------
 
-def _partial_hash(path: str) -> str:
-    """Hash the first and last PARTIAL_CHUNK bytes of a file (fast)."""
-    try:
-        h = xxhash.xxh128()
-        size = os.path.getsize(path)
-        with open(path, "rb") as f:
-            h.update(f.read(PARTIAL_CHUNK))
-            if size > PARTIAL_CHUNK * 2:
-                f.seek(-PARTIAL_CHUNK, os.SEEK_END)
+def _new_hasher(use_sha256: bool = False):
+    """Return a fresh hash object (xxh128 or sha256)."""
+    return hashlib.sha256() if use_sha256 else xxhash.xxh128()
+
+
+def _make_partial_hash(use_sha256: bool = False):
+    """Return a partial-hash function bound to the chosen algorithm."""
+    def _partial_hash(path: str) -> str:
+        try:
+            h = _new_hasher(use_sha256)
+            size = os.path.getsize(path)
+            with open(path, "rb") as f:
                 h.update(f.read(PARTIAL_CHUNK))
-        return h.hexdigest()
-    except (OSError, PermissionError):
-        return ""
+                if size > PARTIAL_CHUNK * 2:
+                    f.seek(-PARTIAL_CHUNK, os.SEEK_END)
+                    h.update(f.read(PARTIAL_CHUNK))
+            return h.hexdigest()
+        except (OSError, PermissionError):
+            return ""
+    return _partial_hash
 
 
-def _full_hash(path: str) -> str:
-    """Stream-hash the entire file in FULL_CHUNK increments."""
-    try:
-        h = xxhash.xxh128()
-        with open(path, "rb") as f:
-            while chunk := f.read(FULL_CHUNK):
-                h.update(chunk)
-        return h.hexdigest()
-    except (OSError, PermissionError):
-        return ""
+def _make_full_hash(use_sha256: bool = False):
+    """Return a full-hash function bound to the chosen algorithm."""
+    def _full_hash(path: str) -> str:
+        try:
+            h = _new_hasher(use_sha256)
+            with open(path, "rb") as f:
+                while chunk := f.read(FULL_CHUNK):
+                    h.update(chunk)
+            return h.hexdigest()
+        except (OSError, PermissionError):
+            return ""
+    return _full_hash
 
 
 def _is_cloud_file(st) -> bool:
@@ -271,19 +295,22 @@ def scan_directory(
     by_hash: bool = True,
     recursive: bool = True,
     min_size: int = 1,
+    use_sha256: bool = False,
     progress: ProgressCallback | None = None,
     cancelled: CancelCheck | None = None,
     extra_skip_dirs: set[str] | None = None,
-) -> list[DuplicateGroup]:
+) -> tuple[list[DuplicateGroup], ScanStats]:
     """
     Scan *root* for duplicate files.
 
-    Returns a list of DuplicateGroup sorted by wasted space (largest first).
+    Returns (groups, stats) where groups is sorted by wasted space (largest first).
     """
     _progress = progress or (lambda *_: None)
     _cancelled = cancelled or (lambda: False)
     skip = SKIP_DIRS | (extra_skip_dirs or set())
     workers = min(4, (os.cpu_count() or 2))
+    hash_name = "SHA-256" if use_sha256 else "xxHash (xxh128)"
+    stats = ScanStats(hash_algorithm=hash_name)
 
     # ------------------------------------------------------------------
     # Phase 1 – enumerate files
@@ -319,6 +346,10 @@ def scan_directory(
             pass
 
     total_files = len(all_files)
+    total_size = sum(fe.size for fe in all_files)
+    stats.total_files_scanned = total_files
+    stats.total_size_scanned = total_size
+    stats.cloud_files_skipped = cloud_skipped
     cloud_msg = f" ({cloud_skipped:,} cloud files skipped)" if cloud_skipped else ""
     _progress(
         f"Phase 1 · {total_files:,} files found{cloud_msg}",
@@ -326,7 +357,7 @@ def scan_directory(
     )
 
     if _cancelled() or total_files == 0:
-        return []
+        return [], stats
 
     results: list[DuplicateGroup] = []
 
@@ -342,8 +373,11 @@ def scan_directory(
             if len(group) >= 2:
                 results.append(DuplicateGroup(DuplicateMode.NAME, key, group))
         results.sort(key=lambda g: g.files[0].size * (len(g.files) - 1), reverse=True)
+        stats.duplicate_groups = len(results)
+        stats.duplicate_files = sum(len(g.files) for g in results)
+        stats.reclaimable_bytes = sum(g.files[0].size * (len(g.files) - 1) for g in results)
         _progress("Phase 2 · Done", total_files, total_files)
-        return results
+        return results, stats
 
     # ------------------------------------------------------------------
     # Phase 2 – group by size
@@ -357,19 +391,23 @@ def scan_directory(
     del size_map
 
     candidates_count = sum(len(g) for g in size_groups.values())
+    stats.size_groups = len(size_groups)
     _progress(
         f"Phase 2 · {len(size_groups):,} size groups ({candidates_count:,} files)",
         total_files, total_files,
     )
 
     if _cancelled():
-        return []
+        return [], stats
 
     if not by_hash:
         for sz, grp in size_groups.items():
             results.append(DuplicateGroup(DuplicateMode.SIZE, f"{sz:,} bytes", grp))
         results.sort(key=lambda g: g.files[0].size * (len(g.files) - 1), reverse=True)
-        return results
+        stats.duplicate_groups = len(results)
+        stats.duplicate_files = sum(len(g.files) for g in results)
+        stats.reclaimable_bytes = sum(g.files[0].size * (len(g.files) - 1) for g in results)
+        return results, stats
 
     # ------------------------------------------------------------------
     # Phase 3 – partial hash (parallel, batched with timeout)
@@ -378,6 +416,7 @@ def scan_directory(
     del size_groups
 
     partial_map: dict[str, list[FileEntry]] = defaultdict(list)
+    partial_hash_fn = _make_partial_hash(use_sha256)
 
     def _assign_partial(fe: FileEntry, h: str):
         fe.partial_hash = h
@@ -385,17 +424,18 @@ def scan_directory(
 
     _parallel_hash_phase(
         candidates,
-        hash_fn=_partial_hash,
+        hash_fn=partial_hash_fn,
         assign_fn=_assign_partial,
         workers=workers,
         cancelled=_cancelled,
         progress=_progress,
-        phase_label="Phase 3 · Partial hash",
+        phase_label=f"Phase 3 · Partial hash ({hash_name})",
     )
 
     del candidates
     partial_groups = {k: g for k, g in partial_map.items() if len(g) >= 2}
     del partial_map
+    stats.partial_groups = len(partial_groups)
 
     _progress(
         f"Phase 3 · {len(partial_groups):,} groups need full hash",
@@ -403,7 +443,7 @@ def scan_directory(
     )
 
     if _cancelled():
-        return []
+        return [], stats
 
     # ------------------------------------------------------------------
     # Phase 4 – full hash (parallel, batched with timeout)
@@ -415,6 +455,7 @@ def scan_directory(
     del partial_groups
 
     full_map: dict[str, list[FileEntry]] = defaultdict(list)
+    full_hash_fn = _make_full_hash(use_sha256)
 
     def _assign_full(fe: FileEntry, h: str):
         fe.full_hash = h
@@ -422,12 +463,12 @@ def scan_directory(
 
     _parallel_hash_phase(
         full_candidates,
-        hash_fn=_full_hash,
+        hash_fn=full_hash_fn,
         assign_fn=_assign_full,
         workers=workers,
         cancelled=_cancelled,
         progress=_progress,
-        phase_label="Phase 4 · Full hash",
+        phase_label=f"Phase 4 · Full hash ({hash_name})",
     )
 
     for key, grp in full_map.items():
@@ -436,5 +477,9 @@ def scan_directory(
 
     results.sort(key=lambda g: g.files[0].size * (len(g.files) - 1), reverse=True)
 
+    stats.duplicate_groups = len(results)
+    stats.duplicate_files = sum(len(g.files) for g in results)
+    stats.reclaimable_bytes = sum(g.files[0].size * (len(g.files) - 1) for g in results)
+
     _progress(f"Done · {len(results):,} duplicate groups", 1, 1)
-    return results
+    return results, stats

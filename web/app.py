@@ -7,15 +7,18 @@ Groups are stored server-side and served paginated to avoid browser crashes.
 
 from __future__ import annotations
 
+import csv
+import io
 import os
 import json
 import uuid
 import threading
+from datetime import datetime
 from pathlib import Path
 
 from flask import Flask, render_template, request, jsonify, Response, stream_with_context
 
-from scanner import DuplicateGroup, DuplicateMode, FileEntry, scan_directory
+from scanner import DuplicateGroup, DuplicateMode, FileEntry, ScanStats, scan_directory
 
 # ---------------------------------------------------------------------------
 # App
@@ -56,6 +59,23 @@ def index():
 # ---------------------------------------------------------------------------
 # Routes – API
 # ---------------------------------------------------------------------------
+@app.route("/api/jobs")
+def api_jobs():
+    """List known jobs so the browser can reconnect after being closed."""
+    with _jobs_lock:
+        result = []
+        for jid, j in _jobs.items():
+            result.append({
+                "id": jid,
+                "status": j["status"],
+                "phase": j["phase"],
+                "root": j.get("root", ""),
+                "started_at": j.get("started_at", ""),
+                "group_count": j["summary"].get("group_count", 0) if j["summary"] else 0,
+            })
+    return jsonify(result)
+
+
 @app.route("/api/browse", methods=["GET"])
 def api_browse():
     """List subdirectories of the given path (for a directory picker)."""
@@ -94,6 +114,8 @@ def api_scan_start():
         "summary": {},
         "error": None,
         "cancelled": False,
+        "root": root,
+        "started_at": datetime.now().isoformat(),
     }
     with _jobs_lock:
         _jobs[job_id] = job
@@ -108,6 +130,7 @@ def api_scan_start():
         "10MB": 10 * 1024**2, "100MB": 100 * 1024**2, "1GB": 1024**3,
     }
     min_size = min_size_map.get(data.get("min_size", "1KB"), 1024)
+    use_sha256 = data.get("use_sha256", False)
 
     def _run():
         try:
@@ -116,13 +139,14 @@ def api_scan_start():
                 job["current"] = cur
                 job["total"] = tot
 
-            groups = scan_directory(
+            groups, stats = scan_directory(
                 root,
                 by_name=by_name,
                 by_size=by_size,
                 by_hash=by_hash,
                 recursive=recursive,
                 min_size=min_size,
+                use_sha256=use_sha256,
                 progress=_progress,
                 cancelled=lambda: job["cancelled"],
             )
@@ -150,6 +174,11 @@ def api_scan_start():
                 "file_count": total_files,
                 "reclaimable": total_waste,
                 "reclaimable_h": _human_size(total_waste),
+                "total_scanned": stats.total_files_scanned,
+                "total_scanned_size": stats.total_size_scanned,
+                "total_scanned_size_h": _human_size(stats.total_size_scanned),
+                "cloud_skipped": stats.cloud_files_skipped,
+                "hash_algorithm": stats.hash_algorithm,
             }
             job["status"] = "done"
         except Exception as exc:
@@ -254,6 +283,79 @@ def api_delete():
             errors.append({"path": p, "error": str(exc)})
 
     return jsonify({"deleted": len(deleted), "errors": errors})
+
+
+@app.route("/api/scan/<job_id>/export/csv")
+def api_export_csv(job_id: str):
+    """Download all groups as a CSV file."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "unknown job"}), 404
+    if job["status"] != "done":
+        return jsonify({"error": "scan not complete"}), 400
+
+    summary = job.get("summary", {})
+    groups = job["groups"]
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["# FileDuplicator Scan Report"])
+    w.writerow(["# Date", datetime.now().isoformat()])
+    w.writerow(["# Hash Algorithm", summary.get("hash_algorithm", "")])
+    w.writerow(["# Files Scanned", summary.get("total_scanned", "")])
+    w.writerow(["# Total Size Scanned", summary.get("total_scanned_size_h", "")])
+    w.writerow(["# Duplicate Groups", summary.get("group_count", "")])
+    w.writerow(["# Duplicate Files", summary.get("file_count", "")])
+    w.writerow(["# Reclaimable", summary.get("reclaimable_h", "")])
+    w.writerow([])
+    w.writerow(["Group", "Mode", "Is Oldest", "File Name", "Path", "Size (bytes)", "Size", "Hash"])
+
+    for g in groups:
+        for f in g["files"]:
+            w.writerow([
+                g["index"],
+                g["mode"],
+                "Yes" if f.get("is_oldest") else "No",
+                f["name"],
+                f["path"],
+                f["size"],
+                f["size_h"],
+                f.get("hash", ""),
+            ])
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return Response(
+        buf.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="FileDuplicator_Report_{ts}.csv"'},
+    )
+
+
+@app.route("/api/scan/<job_id>/export/json")
+def api_export_json(job_id: str):
+    """Download all groups as a JSON file."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "unknown job"}), 404
+    if job["status"] != "done":
+        return jsonify({"error": "scan not complete"}), 400
+
+    summary = job.get("summary", {})
+    report = {
+        "tool": "FileDuplicator",
+        "export_date": datetime.now().isoformat(),
+        "stats": summary,
+        "groups": job["groups"],
+    }
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return Response(
+        json.dumps(report, indent=2, ensure_ascii=False),
+        mimetype="application/json",
+        headers={"Content-Disposition": f'attachment; filename="FileDuplicator_Report_{ts}.json"'},
+    )
 
 
 # ---------------------------------------------------------------------------

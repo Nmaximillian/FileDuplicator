@@ -11,9 +11,12 @@ Performance notes (C: drive / 8 TB scans):
 
 from __future__ import annotations
 
+import csv
+import json
 import os
 import subprocess
 import sys
+from datetime import datetime
 
 from PyQt6.QtCore import (
     Qt,
@@ -47,7 +50,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from scanner import DuplicateGroup, DuplicateMode, FileEntry, scan_directory
+from scanner import DuplicateGroup, DuplicateMode, FileEntry, ScanStats, scan_directory
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -94,7 +97,7 @@ def _open_directory(file_path: str):
 
 class ScanWorker(QThread):
     progress = pyqtSignal(str, int, int)   # phase, current, total
-    finished = pyqtSignal(list)            # list[DuplicateGroup]
+    finished = pyqtSignal(list, object)    # list[DuplicateGroup], ScanStats
     error    = pyqtSignal(str)
 
     def __init__(
@@ -105,6 +108,7 @@ class ScanWorker(QThread):
         by_hash: bool,
         recursive: bool,
         min_size: int,
+        use_sha256: bool = False,
     ):
         super().__init__()
         self.root = root
@@ -113,6 +117,7 @@ class ScanWorker(QThread):
         self.by_hash = by_hash
         self.recursive = recursive
         self.min_size = min_size
+        self.use_sha256 = use_sha256
         self._cancelled = False
 
     def cancel(self):
@@ -120,18 +125,19 @@ class ScanWorker(QThread):
 
     def run(self):
         try:
-            groups = scan_directory(
+            groups, stats = scan_directory(
                 self.root,
                 by_name=self.by_name,
                 by_size=self.by_size,
                 by_hash=self.by_hash,
                 recursive=self.recursive,
                 min_size=self.min_size,
+                use_sha256=self.use_sha256,
                 progress=lambda phase, cur, tot: self.progress.emit(phase, cur, tot),
                 cancelled=lambda: self._cancelled,
             )
             if not self._cancelled:
-                self.finished.emit(groups)
+                self.finished.emit(groups, stats)
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -178,6 +184,8 @@ class MainWindow(QMainWindow):
 
         self._worker: ScanWorker | None = None
         self._groups: list[DuplicateGroup] = []   # ALL groups from scan
+        self._stats: ScanStats | None = None       # last scan stats
+        self._scan_root: str = ""                   # directory that was scanned
         self._displayed: int = 0                   # how many groups are in the tree
 
         self._build_ui()
@@ -221,6 +229,15 @@ class MainWindow(QMainWindow):
         ])
         self._min_size_combo.setCurrentIndex(2)
         opts_layout.addWidget(self._min_size_combo)
+        opts_layout.addWidget(QLabel("  Hash:"))
+        self._hash_combo = QComboBox()
+        self._hash_combo.addItems(["xxHash (fast)", "SHA-256 (paranoid)"])
+        self._hash_combo.setCurrentIndex(0)
+        self._hash_combo.setToolTip(
+            "xxHash is extremely fast and reliable for duplicate detection.\n"
+            "SHA-256 is cryptographic – slower but gives absolute certainty."
+        )
+        opts_layout.addWidget(self._hash_combo)
         root_layout.addWidget(opts_group)
 
         # --- Action buttons ---
@@ -292,6 +309,10 @@ class MainWindow(QMainWindow):
         self._select_all_keep = QPushButton("Deselect All")
         self._select_all_keep.clicked.connect(self._deselect_all)
         bottom.addWidget(self._select_all_keep)
+        self._export_btn = QPushButton("📋  Export Report")
+        self._export_btn.setToolTip("Export scan results to CSV or JSON for comparison / audit")
+        self._export_btn.clicked.connect(self._export_report)
+        bottom.addWidget(self._export_btn)
         self._delete_btn = QPushButton("🗑  Delete Selected")
         self._delete_btn.setStyleSheet("color: #d32f2f; font-weight: bold;")
         self._delete_btn.clicked.connect(self._delete_selected)
@@ -354,6 +375,8 @@ class MainWindow(QMainWindow):
 
         self._tree.clear()
         self._groups.clear()
+        self._stats = None
+        self._scan_root = root
         self._displayed = 0
         self._progress.setValue(0)
         self._scan_btn.setEnabled(False)
@@ -368,6 +391,7 @@ class MainWindow(QMainWindow):
             by_hash=by_hash,
             recursive=self._chk_recursive.isChecked(),
             min_size=self._parse_min_size(),
+            use_sha256=self._hash_combo.currentIndex() == 1,
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_finished)
@@ -389,29 +413,36 @@ class MainWindow(QMainWindow):
         else:
             self._progress.setMaximum(0)
 
-    @pyqtSlot(list)
-    def _on_finished(self, groups: list[DuplicateGroup]):
+    @pyqtSlot(list, object)
+    def _on_finished(self, groups: list[DuplicateGroup], stats: ScanStats):
         self._scan_btn.setEnabled(True)
         self._cancel_btn.setEnabled(False)
         self._groups = groups   # already sorted by wasted space from scanner
+        self._stats = stats
         self._displayed = 0
 
         if not groups:
-            self._summary_label.setText("No duplicates found.")
+            self._summary_label.setText(
+                f"No duplicates found.  "
+                f"Scanned {stats.total_files_scanned:,} files "
+                f"({_human_size(stats.total_size_scanned)})  •  "
+                f"Hash: {stats.hash_algorithm}"
+            )
             self._phase_label.setText("Scan complete – no duplicates.")
             self._progress.setValue(self._progress.maximum() or 1)
             return
 
-        total_dupes = sum(len(g.files) - 1 for g in groups)
-        total_waste = sum(g.files[0].size * (len(g.files) - 1) for g in groups)
         cap = self._cap_spin.value()
         showing = min(cap, len(groups))
 
         self._summary_label.setText(
-            f"Found {len(groups):,} duplicate groups  •  "
-            f"{total_dupes:,} duplicate files  •  "
-            f"{_human_size(total_waste)} reclaimable  •  "
-            f"Showing top {showing:,}"
+            f"Scanned {stats.total_files_scanned:,} files "
+            f"({_human_size(stats.total_size_scanned)})  •  "
+            f"Found {stats.duplicate_groups:,} duplicate groups  •  "
+            f"{stats.duplicate_files:,} duplicate files  •  "
+            f"{_human_size(stats.reclaimable_bytes)} reclaimable  •  "
+            f"Showing top {showing:,}  •  "
+            f"Hash: {stats.hash_algorithm}"
         )
         self._progress.setValue(self._progress.maximum() or 1)
         self._phase_label.setText(
@@ -649,6 +680,125 @@ class MainWindow(QMainWindow):
                 child.setForeground(0, TEXT_COLOR_DEL)
         self._tree.blockSignals(False)
 
+    # ---------------------------------------------- export report
+    def _export_report(self):
+        """Let the user export scan results to CSV or JSON."""
+        if not self._groups:
+            QMessageBox.information(self, "Nothing to export", "Run a scan first.")
+            return
+
+        # Gather current action state from tree
+        actions = self._gather_actions()
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export scan report",
+            f"FileDuplicator_Report_{datetime.now():%Y%m%d_%H%M%S}",
+            "CSV Files (*.csv);;JSON Files (*.json);;All Files (*)",
+        )
+        if not path:
+            return
+
+        try:
+            if path.lower().endswith(".json"):
+                self._export_json(path, actions)
+            else:
+                self._export_csv(path, actions)
+            QMessageBox.information(self, "Export complete", f"Report saved to:\n{path}")
+            self._status.showMessage(f"Report exported to {path}", 10_000)
+        except Exception as exc:
+            QMessageBox.critical(self, "Export error", str(exc))
+
+    def _gather_actions(self) -> dict[str, str]:
+        """Read the current KEEP/DELETE state of every file row in the tree."""
+        actions: dict[str, str] = {}  # path → "KEEP" or "DELETE"
+        root = self._tree.invisibleRootItem()
+        for gi in range(root.childCount()):
+            group_item = root.child(gi)
+            for ci in range(group_item.childCount()):
+                child = group_item.child(ci)
+                p = child.data(0, Qt.ItemDataRole.UserRole)
+                if p:
+                    actions[p] = child.text(0)  # "KEEP" or "DELETE"
+        return actions
+
+    def _export_csv(self, path: str, actions: dict[str, str]):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            # Metadata header rows
+            w.writerow(["# FileDuplicator Scan Report"])
+            w.writerow(["# Date", datetime.now().isoformat()])
+            w.writerow(["# Directory", self._scan_root])
+            if self._stats:
+                w.writerow(["# Hash Algorithm", self._stats.hash_algorithm])
+                w.writerow(["# Files Scanned", self._stats.total_files_scanned])
+                w.writerow(["# Total Size Scanned", _human_size(self._stats.total_size_scanned)])
+                w.writerow(["# Duplicate Groups", self._stats.duplicate_groups])
+                w.writerow(["# Duplicate Files", self._stats.duplicate_files])
+                w.writerow(["# Reclaimable", _human_size(self._stats.reclaimable_bytes)])
+            w.writerow([])
+            w.writerow(["Group", "Mode", "Action", "File Name", "Path", "Size (bytes)", "Size", "Hash", "Modified"])
+
+            for idx, grp in enumerate(self._groups):
+                sorted_files = sorted(grp.files, key=lambda fe: _safe_mtime(fe.path))
+                for fe in sorted_files:
+                    action = actions.get(fe.path, "")
+                    h = fe.full_hash or fe.partial_hash or ""
+                    w.writerow([
+                        idx + 1,
+                        grp.mode.name.capitalize(),
+                        action,
+                        fe.name,
+                        fe.path,
+                        fe.size,
+                        _human_size(fe.size),
+                        h,
+                        datetime.fromtimestamp(_safe_mtime(fe.path)).isoformat() if _safe_mtime(fe.path) else "",
+                    ])
+
+    def _export_json(self, path: str, actions: dict[str, str]):
+        report = {
+            "tool": "FileDuplicator",
+            "export_date": datetime.now().isoformat(),
+            "scan_directory": self._scan_root,
+            "stats": None,
+            "groups": [],
+        }
+        if self._stats:
+            report["stats"] = {
+                "hash_algorithm": self._stats.hash_algorithm,
+                "total_files_scanned": self._stats.total_files_scanned,
+                "total_size_scanned": self._stats.total_size_scanned,
+                "total_size_scanned_h": _human_size(self._stats.total_size_scanned),
+                "duplicate_groups": self._stats.duplicate_groups,
+                "duplicate_files": self._stats.duplicate_files,
+                "reclaimable_bytes": self._stats.reclaimable_bytes,
+                "reclaimable_h": _human_size(self._stats.reclaimable_bytes),
+            }
+        for idx, grp in enumerate(self._groups):
+            sorted_files = sorted(grp.files, key=lambda fe: _safe_mtime(fe.path))
+            files = []
+            for fe in sorted_files:
+                action = actions.get(fe.path, "")
+                files.append({
+                    "path": fe.path,
+                    "name": fe.name,
+                    "size": fe.size,
+                    "size_h": _human_size(fe.size),
+                    "hash": fe.full_hash or fe.partial_hash or "",
+                    "mtime": _safe_mtime(fe.path),
+                    "action": action,
+                })
+            report["groups"].append({
+                "index": idx + 1,
+                "mode": grp.mode.name.capitalize(),
+                "file_count": len(grp.files),
+                "each_size_h": _human_size(grp.files[0].size) if grp.files else "",
+                "files": files,
+            })
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+
     # ---------------------------------------------- bulk selection
     def _auto_select_newer(self):
         self._tree.blockSignals(True)
@@ -713,12 +863,37 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        deleted = 0
+        deleted_paths: list[str] = []
+        deleted_info: list[dict] = []  # for export
         errors = []
         for p, child in to_delete:
             try:
+                # Capture info BEFORE deleting (file won't exist after)
+                info = {
+                    "path": p,
+                    "name": os.path.basename(p),
+                    "size": os.path.getsize(p) if os.path.exists(p) else 0,
+                }
+                # Find matching FileEntry for hash info
+                for grp in self._groups:
+                    for fe in grp.files:
+                        if fe.path == p:
+                            info["size"] = fe.size
+                            info["size_h"] = _human_size(fe.size)
+                            info["hash"] = fe.full_hash or fe.partial_hash or ""
+                            info["group_mode"] = grp.mode.name.capitalize()
+                            break
+                    else:
+                        continue
+                    break
+                if "size_h" not in info:
+                    info["size_h"] = _human_size(info["size"])
+                    info["hash"] = ""
+                    info["group_mode"] = ""
+
                 os.remove(p)
-                deleted += 1
+                deleted_paths.append(p)
+                deleted_info.append(info)
                 parent = child.parent()
                 if parent:
                     parent.removeChild(child)
@@ -731,8 +906,81 @@ class MainWindow(QMainWindow):
             if group_item.childCount() <= 1:
                 root.removeChild(group_item)
 
-        msg = f"Deleted {deleted} file(s) ({_human_size(total_size)} freed)."
+        # Show result dialog with Export option
+        self._show_deletion_result(len(deleted_paths), total_size, errors, deleted_info)
+        self._status.showMessage(f"Deleted {len(deleted_paths)} files.", 10_000)
+
+    def _show_deletion_result(self, count: int, total_size: int, errors: list[str], deleted_info: list[dict]):
+        """Show deletion results with an option to export what was deleted."""
+        dlg = QMessageBox(self)
+        dlg.setWindowTitle("Deletion complete")
+        dlg.setIcon(QMessageBox.Icon.Information)
+
+        msg = f"Deleted {count} file(s) ({_human_size(total_size)} freed)."
         if errors:
             msg += f"\n\n{len(errors)} error(s):\n" + "\n".join(errors[:20])
-        QMessageBox.information(self, "Deletion complete", msg)
-        self._status.showMessage(f"Deleted {deleted} files.", 10_000)
+        dlg.setText(msg)
+
+        # Add custom buttons
+        export_btn = dlg.addButton("📋  Export Deletion Report", QMessageBox.ButtonRole.ActionRole)
+        ok_btn = dlg.addButton(QMessageBox.StandardButton.Ok)
+        dlg.setDefaultButton(ok_btn)
+
+        dlg.exec()
+
+        if dlg.clickedButton() == export_btn:
+            self._export_deletion_report(deleted_info, errors)
+
+    def _export_deletion_report(self, deleted_info: list[dict], errors: list[str]):
+        """Save a CSV/JSON report of what was deleted."""
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export deletion report",
+            f"FileDuplicator_Deleted_{datetime.now():%Y%m%d_%H%M%S}",
+            "CSV Files (*.csv);;JSON Files (*.json);;All Files (*)",
+        )
+        if not path:
+            return
+
+        try:
+            if path.lower().endswith(".json"):
+                report = {
+                    "tool": "FileDuplicator",
+                    "report_type": "deletion",
+                    "deletion_date": datetime.now().isoformat(),
+                    "scan_directory": self._scan_root,
+                    "hash_algorithm": self._stats.hash_algorithm if self._stats else "",
+                    "files_deleted": len(deleted_info),
+                    "total_freed_bytes": sum(d["size"] for d in deleted_info),
+                    "total_freed_h": _human_size(sum(d["size"] for d in deleted_info)),
+                    "deleted_files": deleted_info,
+                    "errors": errors,
+                }
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(report, f, indent=2, ensure_ascii=False)
+            else:
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    w = csv.writer(f)
+                    w.writerow(["# FileDuplicator Deletion Report"])
+                    w.writerow(["# Date", datetime.now().isoformat()])
+                    w.writerow(["# Directory", self._scan_root])
+                    w.writerow(["# Hash Algorithm", self._stats.hash_algorithm if self._stats else ""])
+                    w.writerow(["# Files Deleted", len(deleted_info)])
+                    w.writerow(["# Space Freed", _human_size(sum(d["size"] for d in deleted_info))])
+                    if errors:
+                        w.writerow(["# Errors", len(errors)])
+                    w.writerow([])
+                    w.writerow(["File Name", "Path", "Size (bytes)", "Size", "Hash", "Mode"])
+                    for d in deleted_info:
+                        w.writerow([
+                            d["name"],
+                            d["path"],
+                            d["size"],
+                            d.get("size_h", ""),
+                            d.get("hash", ""),
+                            d.get("group_mode", ""),
+                        ])
+
+            QMessageBox.information(self, "Export complete", f"Deletion report saved to:\n{path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Export error", str(exc))

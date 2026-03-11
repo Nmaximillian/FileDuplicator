@@ -39,6 +39,8 @@ $("#autoSelectBtn").addEventListener("click", autoSelectNewer);
 $("#deselectBtn").addEventListener("click", deselectAll);
 $("#deleteBtn").addEventListener("click", showDeleteConfirm);
 $("#confirmDeleteBtn").addEventListener("click", doDelete);
+$("#exportCsvBtn").addEventListener("click", (e) => { e.preventDefault(); exportReport("csv"); });
+$("#exportJsonBtn").addEventListener("click", (e) => { e.preventDefault(); exportReport("json"); });
 loadMoreBtn.addEventListener("click", loadMore);
 
 async function startScan() {
@@ -65,6 +67,7 @@ async function startScan() {
         by_hash: $("#chkHash").checked,
         recursive: $("#chkRecursive").checked,
         min_size: $("#minSize").value,
+        use_sha256: $("#hashAlgo").value === "sha256",
     };
 
     try {
@@ -76,6 +79,7 @@ async function startScan() {
         const data = await res.json();
         if (data.error) throw new Error(data.error);
         currentJobId = data.job_id;
+        localStorage.setItem("fd_job_id", data.job_id);
         pollProgress(data.job_id);
     } catch (e) {
         alert("Scan failed: " + e.message);
@@ -83,6 +87,63 @@ async function startScan() {
         cancelBtn.disabled = true;
     }
 }
+
+// ── Auto-reconnect to running/finished job on page load ──
+async function tryReconnect() {
+    const savedId = localStorage.getItem("fd_job_id");
+    if (!savedId) return;
+
+    try {
+        const res = await fetch("/api/jobs");
+        const jobs = await res.json();
+        const job = jobs.find((j) => j.id === savedId);
+        if (!job) { localStorage.removeItem("fd_job_id"); return; }
+
+        currentJobId = savedId;
+
+        if (job.status === "running") {
+            // Scan is still running – reconnect to SSE
+            if (job.root) dirInput.value = job.root;
+            scanBtn.disabled = true;
+            cancelBtn.disabled = false;
+            progressArea.classList.remove("d-none");
+            phaseLabel.textContent = `Reconnected · ${job.phase || "running"}…`;
+            pollProgress(savedId);
+        } else if (job.status === "done") {
+            // Scan finished while we were away – show results
+            if (job.root) dirInput.value = job.root;
+            const progRes = await fetch(`/api/scan/${savedId}/progress`);
+            // Read the SSE stream for summary
+            const reader = progRes.body.getReader();
+            const decoder = new TextDecoder();
+            let text = "";
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                text += decoder.decode(value, { stream: true });
+            }
+            // Parse last SSE data line
+            const lines = text.split("\n").filter((l) => l.startsWith("data: "));
+            if (lines.length > 0) {
+                const d = JSON.parse(lines[lines.length - 1].replace("data: ", ""));
+                if (d.summary) {
+                    summaryData = d.summary;
+                    totalGroupCount = d.summary.group_count;
+                    phaseLabel.textContent = `Reconnected · ${totalGroupCount.toLocaleString()} duplicate groups`;
+                    progressArea.classList.remove("d-none");
+                    progressBar.style.width = "100%";
+                    progressBar.classList.remove("progress-bar-animated");
+                    showSummary(d.summary);
+                    loadGroups(savedId, 0);
+                }
+            }
+        }
+    } catch (e) {
+        console.warn("Reconnect failed:", e);
+    }
+}
+
+tryReconnect();
 
 function pollProgress(jobId) {
     if (eventSource) eventSource.close();
@@ -138,6 +199,22 @@ async function cancelScan() {
 // ── Summary ──
 function showSummary(s) {
     resultsArea.classList.remove("d-none");
+
+    // Scan stats bar (total files scanned, hash algo)
+    const statsBar = $("#scanStatsBar");
+    statsBar.classList.remove("d-none");
+    let statsHtml = `
+        <i class="bi bi-bar-chart me-2"></i>
+        Scanned <strong>${s.total_scanned.toLocaleString()}</strong> files
+        (<strong>${s.total_scanned_size_h}</strong>)
+        &nbsp;•&nbsp; Hash: <strong>${s.hash_algorithm}</strong>
+    `;
+    if (s.cloud_skipped > 0) {
+        statsHtml += ` &nbsp;•&nbsp; ${s.cloud_skipped.toLocaleString()} cloud files skipped`;
+    }
+    statsBar.innerHTML = statsHtml;
+
+    // Duplicate summary bar
     summaryBar.innerHTML = `
         <i class="bi bi-info-circle me-2"></i>
         <strong>${s.group_count.toLocaleString()}</strong>&nbsp;duplicate groups &nbsp;•&nbsp;
@@ -480,6 +557,20 @@ async function doDelete() {
     const paths = getSelectedPaths();
     bootstrap.Modal.getInstance($("#deleteModal")).hide();
 
+    // Collect file info BEFORE deleting (for deletion report)
+    const fileInfoBefore = [];
+    document.querySelectorAll(".dup-check:checked").forEach((cb) => {
+        const tr = cb.closest("tr");
+        if (!tr) return;
+        fileInfoBefore.push({
+            path: cb.dataset.path,
+            name: tr.querySelector("td:nth-child(3)")?.textContent || "",
+            size: parseInt(cb.dataset.size || "0"),
+            size_h: tr.querySelector("td:nth-child(5)")?.textContent || "",
+            hash: tr.querySelector(".hash-cell")?.textContent || "",
+        });
+    });
+
     // Show progress
     const btn = $("#deleteBtn");
     btn.disabled = true;
@@ -504,12 +595,10 @@ async function doDelete() {
             if (grp.querySelectorAll("tr[data-path]").length <= 1) grp.remove();
         });
 
-        let msg = `Deleted ${data.deleted} file(s).`;
-        if (data.errors && data.errors.length > 0) {
-            msg += `\n${data.errors.length} error(s):\n` +
-                data.errors.map((e) => `${e.path}: ${e.error}`).join("\n");
-        }
-        alert(msg);
+        // Show deletion result modal
+        const totalFreed = fileInfoBefore.reduce((s, f) => s + f.size, 0);
+        lastDeletionInfo = { files: fileInfoBefore, count: data.deleted, freed: totalFreed, errors: data.errors || [] };
+        showDeletionResult(data, totalFreed);
     } catch (e) {
         alert("Delete failed: " + e.message);
     } finally {
@@ -518,9 +607,76 @@ async function doDelete() {
     }
 }
 
+let lastDeletionInfo = null;
+
+function showDeletionResult(data, totalFreed) {
+    let body = `<p>Deleted <strong>${data.deleted}</strong> file(s) (${humanSize(totalFreed)} freed).</p>`;
+    if (data.errors && data.errors.length > 0) {
+        body += `<p class="text-warning">${data.errors.length} error(s):</p><ul class="small">`;
+        data.errors.slice(0, 10).forEach((e) => {
+            body += `<li>${escHtml(e.path)}: ${escHtml(e.error)}</li>`;
+        });
+        body += `</ul>`;
+    }
+    $("#deletionResultBody").innerHTML = body;
+    new bootstrap.Modal($("#deletionResultModal")).show();
+}
+
+function exportDeletionReport(format) {
+    if (!lastDeletionInfo || !lastDeletionInfo.files.length) return alert("No deletion data to export.");
+    const info = lastDeletionInfo;
+    const ts = new Date().toISOString();
+
+    if (format === "json") {
+        const report = {
+            tool: "FileDuplicator",
+            report_type: "deletion",
+            deletion_date: ts,
+            files_deleted: info.count,
+            total_freed_bytes: info.freed,
+            total_freed_h: humanSize(info.freed),
+            deleted_files: info.files,
+            errors: info.errors,
+        };
+        downloadBlob(JSON.stringify(report, null, 2), `FileDuplicator_Deleted_${ts.slice(0,10)}.json`, "application/json");
+    } else {
+        let csv = "# FileDuplicator Deletion Report\n";
+        csv += `# Date,${ts}\n`;
+        csv += `# Files Deleted,${info.count}\n`;
+        csv += `# Space Freed,${humanSize(info.freed)}\n`;
+        csv += "\nFile Name,Path,Size (bytes),Size,Hash\n";
+        for (const f of info.files) {
+            csv += `${csvEsc(f.name)},${csvEsc(f.path)},${f.size},${csvEsc(f.size_h)},${csvEsc(f.hash)}\n`;
+        }
+        downloadBlob(csv, `FileDuplicator_Deleted_${ts.slice(0,10)}.csv`, "text/csv");
+    }
+}
+
+function csvEsc(s) {
+    if (!s) return "";
+    if (s.includes(",") || s.includes('"') || s.includes("\n")) return '"' + s.replace(/"/g, '""') + '"';
+    return s;
+}
+
+function downloadBlob(content, filename, mime) {
+    const blob = new Blob([content], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+}
+
 function getSelectedPaths() {
     return Array.from(document.querySelectorAll(".dup-check:checked"))
         .map((cb) => cb.dataset.path);
+}
+
+// ── Export ──
+function exportReport(format) {
+    if (!currentJobId) return alert("No scan results to export.");
+    window.open(`/api/scan/${currentJobId}/export/${format}`, "_blank");
 }
 
 // ── Browse modal ──

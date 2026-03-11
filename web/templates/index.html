@@ -68,6 +68,16 @@
                         <option value="1GB">1 GB</option>
                     </select>
                 </div>
+                <div class="col-auto">
+                    <label class="form-label mb-0 me-1">Hash:</label>
+                </div>
+                <div class="col-auto">
+                    <select id="hashAlgo" class="form-select form-select-sm" style="width:auto"
+                            title="xxHash is fast &amp; reliable. SHA-256 is cryptographic (slower but absolute certainty).">
+                        <option value="xxhash" selected>xxHash (fast)</option>
+                        <option value="sha256">SHA-256 (paranoid)</option>
+                    </select>
+                </div>
             </div>
         </div>
     </div>
@@ -93,6 +103,9 @@
 
     <!-- Results -->
     <div id="resultsArea" class="d-none">
+        <!-- Scan stats -->
+        <div id="scanStatsBar" class="alert alert-secondary d-flex align-items-center mb-2 py-2 small d-none"></div>
+
         <!-- Summary -->
         <div id="summaryBar" class="alert alert-info d-flex align-items-center mb-3 py-2"></div>
 
@@ -107,7 +120,21 @@
             <span class="text-muted small ms-2">
                 <i class="bi bi-mouse"></i> Right-click group headers for bulk actions
             </span>
-            <div class="ms-auto">
+            <div class="ms-auto d-flex gap-2">
+                <div class="dropdown">
+                    <button id="exportBtn" class="btn btn-sm btn-outline-info dropdown-toggle" type="button"
+                            data-bs-toggle="dropdown" aria-expanded="false">
+                        <i class="bi bi-download"></i> Export Report
+                    </button>
+                    <ul class="dropdown-menu dropdown-menu-dark">
+                        <li><a class="dropdown-item" href="#" id="exportCsvBtn">
+                            <i class="bi bi-filetype-csv"></i> Export as CSV
+                        </a></li>
+                        <li><a class="dropdown-item" href="#" id="exportJsonBtn">
+                            <i class="bi bi-filetype-json"></i> Export as JSON
+                        </a></li>
+                    </ul>
+                </div>
                 <button id="deleteBtn" class="btn btn-sm btn-danger fw-bold">
                     <i class="bi bi-trash3"></i> Delete Selected
                 </button>
@@ -169,6 +196,30 @@
                 <button id="confirmDeleteBtn" class="btn btn-sm btn-danger">
                     <i class="bi bi-trash3"></i> Delete Permanently
                 </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Deletion result modal -->
+<div class="modal fade" id="deletionResultModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark">
+            <div class="modal-header py-2">
+                <h6 class="modal-title"><i class="bi bi-check-circle-fill text-success"></i> Deletion Complete</h6>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body" id="deletionResultBody"></div>
+            <div class="modal-footer py-2 d-flex justify-content-between">
+                <div class="d-flex gap-2">
+                    <button class="btn btn-sm btn-outline-info" onclick="exportDeletionReport('csv')">
+                        <i class="bi bi-filetype-csv"></i> Export as CSV
+                    </button>
+                    <button class="btn btn-sm btn-outline-info" onclick="exportDeletionReport('json')">
+                        <i class="bi bi-filetype-json"></i> Export as JSON
+                    </button>
+                </div>
+                <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal">OK</button>
             </div>
         </div>
     </div>
