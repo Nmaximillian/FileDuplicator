@@ -2,7 +2,7 @@
 
 A fast duplicate-file scanner and cleaner for large directory trees (8 TB+). Available as a **Windows desktop app** or a **web UI** you can run on a NAS via Docker.
 
-![Python](https://img.shields.io/badge/Python-3.10+-blue) ![PyQt6](https://img.shields.io/badge/Desktop-PyQt6-green) ![Flask](https://img.shields.io/badge/Web-Flask-lightgrey) ![Docker](https://img.shields.io/badge/NAS-Docker-blue) ![xxhash](https://img.shields.io/badge/hash-xxhash-orange)
+![Python](https://img.shields.io/badge/Python-3.10+-blue) ![PyQt6](https://img.shields.io/badge/Desktop-PyQt6-green) ![Flask](https://img.shields.io/badge/Web-Flask-lightgrey) ![Docker](https://img.shields.io/badge/NAS-Docker-blue) ![xxhash](https://img.shields.io/badge/hash-xxHash%20%7C%20SHA--256-orange)
 
 ---
 
@@ -71,23 +71,41 @@ pyinstaller --onefile --windowed --name "FileDuplicator" \
 
 ### Duplicate Detection
 - **Three match criteria** – file name, size, and/or content hash (combinable)
+- **Hash algorithm choice** – xxHash (xxh128) for speed or SHA-256 for cryptographic certainty
 - **Recursive or flat scan** – choose whether to walk subdirectories
 - **Minimum file size filter** – skip tiny files (0 B → 1 GB threshold)
+- **Cloud file detection** – automatically skips OneDrive / iCloud placeholder files on Windows
 
 ### Performance (designed for 8 TB+)
 - **Progressive hashing** – groups by size → partial hash (first+last 64 KB) → full hash only on true collisions
-- **xxhash (xxh128)** – ~10× faster than MD5/SHA
+- **xxHash (xxh128)** – ~10× faster than SHA-256, reliable for everyday use
+- **SHA-256** – cryptographic hash for maximum confidence on critical data
+- **Parallel hashing** – batched multi-threaded I/O with size-aware timeouts
+- **Paginated results** – handles 100K+ duplicate groups without crashing
 - **Background scanning** – UI stays responsive (desktop: QThread, web: SSE streaming)
+
+### Search, Sort & Compare
+- **Search / filter** – find groups by file name or path across 100K+ results
+- **Sort controls** – sort by size ↑↓, file count ↑↓, or name A→Z / Z→A
+- **Compare scans** – run xxHash and SHA-256 scans, then compare them side-by-side to verify results
+
+### Export & Audit
+- **Export reports** – download scan results as CSV or JSON for offline review
+- **Deletion log export** – after deleting, export a detailed log of what was removed
+- **Scan statistics** – total files scanned, size, cloud files skipped, hash algorithm, elapsed time, and timestamp
 
 ### Desktop-only features
 - **Double-click** a file → opens Explorer with file selected
 - **Right-click context menu** → Show in Explorer / Open folder / Toggle KEEP-DELETE
+- **Compare JSON reports** – load two exported JSON files and diff them
 - **Custom `.ico` icon** in title bar, taskbar, and `.exe`
 - **Remembers last directory** between sessions
 
 ### Web-only features
 - **Browser-based directory picker** – navigate your NAS shares visually
 - **Right-click context menu** → Copy full path / Copy directory / Toggle KEEP-DELETE
+- **Auto-reconnect** – close the browser tab and come back later; your scan is still there
+- **SSE with heartbeat** – reliable progress streaming even for multi-hour SHA-256 scans
 - **Responsive dark theme** – works on desktop browsers, tablets, and phones
 - **Runs headless** – no display server needed (perfect for NAS)
 
@@ -97,6 +115,7 @@ pyinstaller --onefile --windowed --name "FileDuplicator" \
 - **Bulk actions** – "Select All Newer as Delete" / "Deselect All"
 - **Confirmation dialog** – shows file count and reclaimable space before deletion
 - **Per-file error reporting** after deletion
+- **Elapsed time & timestamp** – see how long the scan took and when it finished
 
 ---
 
@@ -104,12 +123,15 @@ pyinstaller --onefile --windowed --name "FileDuplicator" \
 
 | Phase | What happens | Disk reads |
 |---|---|---|
-| 1. Enumerate | `os.walk()` collects file name + size from metadata | None |
+| 1. Enumerate | `os.scandir()` collects file name + size, skips cloud placeholders | None |
 | 2. Group by size | Files with a unique size are discarded | None |
-| 3. Partial hash | First + last 64 KB hashed via xxhash | Tiny |
-| 4. Full hash | Only true collisions fully hashed (1 MB chunks) | Minimal |
+| 3. Partial hash | First + last 64 KB hashed (xxHash or SHA-256) | Tiny |
+| 4. Full hash | Only true collisions fully hashed in 4 MB chunks | Minimal |
 
-For a typical 8 TB drive, this reads well under 1% of total data.
+For a typical 8 TB drive with ~680K files, this reads well under 1% of total data.
+
+> **Hash algorithm choice:** xxHash (xxh128) is ~10× faster and perfectly reliable.
+> SHA-256 is available for extra confidence when dealing with irreplaceable data.
 
 ---
 
@@ -118,18 +140,19 @@ For a typical 8 TB drive, this reads well under 1% of total data.
 ```
 FileDuplicator/
 ├── main.py                  # Desktop entry point (PyQt6)
-├── main_window.py           # Desktop UI
+├── main_window.py           # Desktop UI (search, sort, compare, export)
 ├── scanner.py               # Core scan engine (shared by both editions)
 ├── requirements.txt         # Desktop dependencies (PyQt6, xxhash)
 ├── requirements-web.txt     # Web dependencies (Flask, gunicorn, xxhash)
 ├── FileDuplicator.ico       # App icon
+├── FileDuplicator.spec      # PyInstaller build configuration
 ├── generate_icon.py         # Regenerate the .ico via Pillow
 ├── web/
-│   ├── app.py               # Flask server + REST API
+│   ├── app.py               # Flask server + REST API + SSE + compare
 │   ├── templates/
-│   │   └── index.html       # Web UI page
+│   │   └── index.html       # Web UI (Bootstrap 5 dark theme)
 │   └── static/
-│       ├── app.js           # Client-side logic
+│       ├── app.js           # Client-side logic (pagination, sort, search)
 │       ├── style.css         # Dark theme styles
 │       └── favicon.svg       # Browser tab icon
 ├── Dockerfile               # Docker image build
