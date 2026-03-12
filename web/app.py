@@ -11,6 +11,7 @@ import csv
 import io
 import os
 import json
+import time as _time
 import uuid
 import threading
 from datetime import datetime
@@ -39,6 +40,17 @@ def _human_size(n: int | float) -> str:
             return f"{n:,.1f} {unit}"
         n /= 1024
     return f"{n:,.1f} PB"
+
+
+def _human_elapsed(seconds: float) -> str:
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    if h > 0:
+        return f"{h}h {m}m {s}s"
+    if m > 0:
+        return f"{m}m {s}s"
+    return f"{s}s"
 
 
 def _safe_mtime(path: str) -> float:
@@ -72,6 +84,8 @@ def api_jobs():
                 "root": j.get("root", ""),
                 "started_at": j.get("started_at", ""),
                 "group_count": j["summary"].get("group_count", 0) if j["summary"] else 0,
+                "finished_at": j.get("finished_at"),
+                "elapsed_h": _human_elapsed(j["elapsed"]) if j.get("elapsed") else None,
             })
     return jsonify(result)
 
@@ -116,6 +130,9 @@ def api_scan_start():
         "cancelled": False,
         "root": root,
         "started_at": datetime.now().isoformat(),
+        "_start_time": _time.monotonic(),
+        "finished_at": None,
+        "elapsed": None,
     }
     with _jobs_lock:
         _jobs[job_id] = job
@@ -151,6 +168,12 @@ def api_scan_start():
                 cancelled=lambda: job["cancelled"],
             )
 
+            # Update phase so the UI doesn't appear frozen during
+            # serialisation of 100K+ groups
+            job["phase"] = "Preparing results\u2026"
+            job["current"] = 0
+            job["total"] = 0
+
             # Serialise and sort by file size descending (biggest dupes first)
             serialised = _serialise_groups(groups)
             serialised.sort(
@@ -180,6 +203,12 @@ def api_scan_start():
                 "cloud_skipped": stats.cloud_files_skipped,
                 "hash_algorithm": stats.hash_algorithm,
             }
+            elapsed = _time.monotonic() - job["_start_time"]
+            job["finished_at"] = datetime.now().isoformat()
+            job["elapsed"] = elapsed
+            job["summary"]["finished_at"] = job["finished_at"]
+            job["summary"]["elapsed"] = elapsed
+            job["summary"]["elapsed_h"] = _human_elapsed(elapsed)
             job["status"] = "done"
         except Exception as exc:
             job["error"] = str(exc)
@@ -195,6 +224,7 @@ def api_scan_progress(job_id: str):
     """SSE stream of scan progress.  On completion sends summary only (not all groups)."""
     def generate():
         import time
+        tick = 0
         while True:
             with _jobs_lock:
                 job = _jobs.get(job_id)
@@ -219,6 +249,13 @@ def api_scan_progress(job_id: str):
                 return
 
             yield f"data: {json.dumps(payload)}\n\n"
+
+            # Send SSE keep-alive comment every ~15s to prevent proxy/browser
+            # timeouts during long SHA-256 scans
+            tick += 1
+            if tick % 37 == 0:  # ~15s at 0.4s intervals
+                yield ": keepalive\n\n"
+
             time.sleep(0.4)
 
     return Response(
@@ -230,7 +267,7 @@ def api_scan_progress(job_id: str):
 
 @app.route("/api/scan/<job_id>/groups")
 def api_scan_groups(job_id: str):
-    """Paginated group results.  ?offset=0&limit=50"""
+    """Paginated group results.  ?offset=0&limit=50&sort=size_desc&search=keyword"""
     with _jobs_lock:
         job = _jobs.get(job_id)
     if not job:
@@ -238,11 +275,39 @@ def api_scan_groups(job_id: str):
     if job["status"] != "done":
         return jsonify({"error": "scan not complete"}), 400
 
+    search = request.args.get("search", "").strip().lower()
+    sort_by = request.args.get("sort", "size_desc")
     offset = request.args.get("offset", 0, type=int)
     limit = request.args.get("limit", PAGE_SIZE, type=int)
     limit = min(limit, 200)  # cap max per request
 
     groups = job["groups"]
+
+    # Filter by search keyword (file name or path)
+    if search:
+        filtered = []
+        for g in groups:
+            for f in g["files"]:
+                if search in f["name"].lower() or search in f["path"].lower():
+                    filtered.append(g)
+                    break
+        groups = filtered
+
+    # Sort
+    if sort_by == "size_asc":
+        groups = sorted(groups, key=lambda g: g["files"][0]["size"] if g["files"] else 0)
+    elif sort_by == "size_desc":
+        groups = sorted(groups, key=lambda g: g["files"][0]["size"] if g["files"] else 0, reverse=True)
+    elif sort_by == "files_desc":
+        groups = sorted(groups, key=lambda g: g["file_count"], reverse=True)
+    elif sort_by == "files_asc":
+        groups = sorted(groups, key=lambda g: g["file_count"])
+    elif sort_by == "name_asc":
+        groups = sorted(groups, key=lambda g: g["files"][0]["name"].lower() if g["files"] else "")
+    elif sort_by == "name_desc":
+        groups = sorted(groups, key=lambda g: g["files"][0]["name"].lower() if g["files"] else "", reverse=True)
+    # default: size_desc (already sorted that way from scan)
+
     page = groups[offset: offset + limit]
     return jsonify({
         "groups": page,
@@ -260,6 +325,72 @@ def api_scan_cancel(job_id: str):
         job["cancelled"] = True
         return jsonify({"ok": True})
     return jsonify({"error": "unknown job"}), 404
+
+
+@app.route("/api/compare", methods=["POST"])
+def api_compare():
+    """Compare two completed scan jobs and return the differences."""
+    data = request.get_json(force=True)
+    job_a_id = data.get("job_a")
+    job_b_id = data.get("job_b")
+
+    with _jobs_lock:
+        job_a = _jobs.get(job_a_id)
+        job_b = _jobs.get(job_b_id)
+    if not job_a or not job_b:
+        return jsonify({"error": "One or both jobs not found"}), 404
+    if job_a["status"] != "done" or job_b["status"] != "done":
+        return jsonify({"error": "Both scans must be complete"}), 400
+
+    # Build file-path sets for each job
+    def _file_set(job):
+        s = {}  # path → {group_index, hash, size, name}
+        for g in job["groups"]:
+            for f in g["files"]:
+                s[f["path"]] = {"group": g["index"], "hash": f.get("hash", ""), "size": f["size"],
+                                "name": f["name"], "size_h": f["size_h"]}
+        return s
+
+    def _group_keys(job):
+        """Return dict of group_key → group info."""
+        d = {}
+        for g in job["groups"]:
+            paths = tuple(sorted(f["path"] for f in g["files"]))
+            d[paths] = g
+        return d
+
+    files_a = _file_set(job_a)
+    files_b = _file_set(job_b)
+
+    groups_a = _group_keys(job_a)
+    groups_b = _group_keys(job_b)
+
+    # Groups only in A (not in B) — these are likely false-positive matches
+    only_in_a = []
+    for paths_key, grp in groups_a.items():
+        if paths_key not in groups_b:
+            only_in_a.append(grp)
+
+    only_in_b = []
+    for paths_key, grp in groups_b.items():
+        if paths_key not in groups_a:
+            only_in_b.append(grp)
+
+    sum_a = job_a["summary"]
+    sum_b = job_b["summary"]
+
+    return jsonify({
+        "job_a": {"id": job_a_id, "hash": sum_a.get("hash_algorithm", ""),
+                  "groups": sum_a.get("group_count", 0), "files": sum_a.get("file_count", 0),
+                  "reclaimable": sum_a.get("reclaimable_h", "")},
+        "job_b": {"id": job_b_id, "hash": sum_b.get("hash_algorithm", ""),
+                  "groups": sum_b.get("group_count", 0), "files": sum_b.get("file_count", 0),
+                  "reclaimable": sum_b.get("reclaimable_h", "")},
+        "only_in_a": only_in_a[:200],  # cap for safety
+        "only_in_b": only_in_b[:200],
+        "only_in_a_count": len(only_in_a),
+        "only_in_b_count": len(only_in_b),
+    })
 
 
 @app.route("/api/delete", methods=["POST"])

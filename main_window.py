@@ -16,6 +16,7 @@ import json
 import os
 import subprocess
 import sys
+import time as _time
 from datetime import datetime
 
 from PyQt6.QtCore import (
@@ -62,6 +63,17 @@ def _human_size(n: int | float) -> str:
             return f"{n:,.1f} {unit}"
         n /= 1024
     return f"{n:,.1f} PB"
+
+
+def _human_elapsed(seconds: float) -> str:
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    if h > 0:
+        return f"{h}h {m}m {s}s"
+    if m > 0:
+        return f"{m}m {s}s"
+    return f"{s}s"
 
 
 def _icon_path() -> str:
@@ -187,6 +199,9 @@ class MainWindow(QMainWindow):
         self._stats: ScanStats | None = None       # last scan stats
         self._scan_root: str = ""                   # directory that was scanned
         self._displayed: int = 0                   # how many groups are in the tree
+        self._scan_start_time: float = 0.0          # monotonic start time
+        self._scan_elapsed: float = 0.0             # elapsed seconds
+        self._scan_finished_at: str = ""            # ISO timestamp
 
         self._build_ui()
         self._restore_state()
@@ -277,6 +292,28 @@ class MainWindow(QMainWindow):
         cap_layout.addStretch()
         root_layout.addLayout(cap_layout)
 
+        # --- Search & Sort ---
+        search_sort_layout = QHBoxLayout()
+        search_sort_layout.addWidget(QLabel("🔍 Search:"))
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Filter by file name or path…")
+        self._search_edit.setClearButtonEnabled(True)
+        self._search_edit.textChanged.connect(self._on_search_changed)
+        search_sort_layout.addWidget(self._search_edit, 1)
+        search_sort_layout.addWidget(QLabel("  Sort:"))
+        self._sort_combo = QComboBox()
+        self._sort_combo.addItems([
+            "Size ↓ (largest)", "Size ↑ (smallest)",
+            "File count ↓", "File count ↑",
+            "Name A→Z", "Name Z→A",
+        ])
+        self._sort_combo.currentIndexChanged.connect(self._on_sort_changed)
+        search_sort_layout.addWidget(self._sort_combo)
+        self._filter_label = QLabel("")
+        self._filter_label.setStyleSheet("color: #aaa;")
+        search_sort_layout.addWidget(self._filter_label)
+        root_layout.addLayout(search_sort_layout)
+
         # --- Results tree ---
         self._tree = QTreeWidget()
         self._tree.setColumnCount(5)
@@ -313,6 +350,10 @@ class MainWindow(QMainWindow):
         self._export_btn.setToolTip("Export scan results to CSV or JSON for comparison / audit")
         self._export_btn.clicked.connect(self._export_report)
         bottom.addWidget(self._export_btn)
+        self._compare_btn = QPushButton("⚖  Compare Reports")
+        self._compare_btn.setToolTip("Compare two exported JSON reports to find differences")
+        self._compare_btn.clicked.connect(self._compare_reports)
+        bottom.addWidget(self._compare_btn)
         self._delete_btn = QPushButton("🗑  Delete Selected")
         self._delete_btn.setStyleSheet("color: #d32f2f; font-weight: bold;")
         self._delete_btn.clicked.connect(self._delete_selected)
@@ -383,6 +424,9 @@ class MainWindow(QMainWindow):
         self._cancel_btn.setEnabled(True)
         self._summary_label.setText("")
         self._load_more_btn.setEnabled(False)
+        self._search_edit.clear()
+        self._filter_label.setText("")
+        self._scan_start_time = _time.monotonic()
 
         self._worker = ScanWorker(
             root,
@@ -420,13 +464,17 @@ class MainWindow(QMainWindow):
         self._groups = groups   # already sorted by wasted space from scanner
         self._stats = stats
         self._displayed = 0
+        self._scan_elapsed = _time.monotonic() - self._scan_start_time
+        self._scan_finished_at = datetime.now().isoformat()
 
         if not groups:
             self._summary_label.setText(
                 f"No duplicates found.  "
                 f"Scanned {stats.total_files_scanned:,} files "
                 f"({_human_size(stats.total_size_scanned)})  •  "
-                f"Hash: {stats.hash_algorithm}"
+                f"Hash: {stats.hash_algorithm}  •  "
+                f"⏱ {_human_elapsed(self._scan_elapsed)}  •  "
+                f"🕐 {datetime.now():%H:%M:%S}"
             )
             self._phase_label.setText("Scan complete – no duplicates.")
             self._progress.setValue(self._progress.maximum() or 1)
@@ -442,7 +490,9 @@ class MainWindow(QMainWindow):
             f"{stats.duplicate_files:,} duplicate files  •  "
             f"{_human_size(stats.reclaimable_bytes)} reclaimable  •  "
             f"Showing top {showing:,}  •  "
-            f"Hash: {stats.hash_algorithm}"
+            f"Hash: {stats.hash_algorithm}  •  "
+            f"⏱ {_human_elapsed(self._scan_elapsed)}  •  "
+            f"🕐 {datetime.now():%H:%M:%S}"
         )
         self._progress.setValue(self._progress.maximum() or 1)
         self._phase_label.setText(
@@ -832,6 +882,147 @@ class MainWindow(QMainWindow):
                 child.setForeground(0, TEXT_COLOR_KEEP)
         self._tree.setUpdatesEnabled(True)
         self._tree.blockSignals(False)
+
+    # ---------------------------------------------- search & sort
+    def _on_search_changed(self, text: str):
+        """Filter tree groups by file name or path containing the search text."""
+        search = text.strip().lower()
+        root = self._tree.invisibleRootItem()
+        visible = 0
+        for gi in range(root.childCount()):
+            group_item = root.child(gi)
+            match = False
+            if not search:
+                match = True
+            else:
+                for ci in range(group_item.childCount()):
+                    child = group_item.child(ci)
+                    name = child.text(1).lower()
+                    path = child.text(2).lower()
+                    if search in name or search in path:
+                        match = True
+                        break
+            group_item.setHidden(not match)
+            if match:
+                visible += 1
+
+        if search:
+            self._filter_label.setText(f"{visible:,} of {root.childCount():,} groups match")
+        else:
+            self._filter_label.setText("")
+
+    def _on_sort_changed(self, index: int):
+        """Re-sort groups and rebuild tree."""
+        if not self._groups:
+            return
+
+        sort_funcs = {
+            0: lambda g: -(g.files[0].size if g.files else 0),      # size desc
+            1: lambda g: (g.files[0].size if g.files else 0),       # size asc
+            2: lambda g: -len(g.files),                              # file count desc
+            3: lambda g: len(g.files),                               # file count asc
+            4: lambda g: (g.files[0].name.lower() if g.files else ""),  # name asc
+            5: lambda g: (g.files[0].name.lower() if g.files else ""),  # name desc (reversed)
+        }
+        key_func = sort_funcs.get(index, sort_funcs[0])
+
+        if index == 5:
+            self._groups.sort(key=key_func, reverse=True)
+        else:
+            self._groups.sort(key=key_func)
+
+        # Rebuild tree
+        self._displayed = 0
+        self._start_batched_populate()
+
+    # ---------------------------------------------- compare reports
+    def _compare_reports(self):
+        """Compare two exported JSON reports to find differences."""
+        file_a, _ = QFileDialog.getOpenFileName(
+            self, "Select first report (e.g. xxHash scan)", "",
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not file_a:
+            return
+        file_b, _ = QFileDialog.getOpenFileName(
+            self, "Select second report (e.g. SHA-256 scan)", "",
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not file_b:
+            return
+
+        try:
+            with open(file_a, "r", encoding="utf-8") as f:
+                report_a = json.load(f)
+            with open(file_b, "r", encoding="utf-8") as f:
+                report_b = json.load(f)
+
+            hash_a = report_a.get("stats", {}).get("hash_algorithm", "Scan A") if report_a.get("stats") else "Scan A"
+            hash_b = report_b.get("stats", {}).get("hash_algorithm", "Scan B") if report_b.get("stats") else "Scan B"
+
+            groups_a_count = len(report_a.get("groups", []))
+            groups_b_count = len(report_b.get("groups", []))
+
+            # Build file-path-set keyed groups
+            def group_keys(report):
+                d = {}
+                for g in report.get("groups", []):
+                    paths = tuple(sorted(f["path"] for f in g.get("files", [])))
+                    d[paths] = g
+                return d
+
+            keys_a = group_keys(report_a)
+            keys_b = group_keys(report_b)
+
+            only_a = [keys_a[k] for k in keys_a if k not in keys_b]
+            only_b = [keys_b[k] for k in keys_b if k not in keys_a]
+
+            # Build result text
+            lines = []
+            lines.append(f"═══ Comparison: {hash_a} vs {hash_b} ═══\n")
+            lines.append(f"Scan A ({hash_a}):  {groups_a_count:,} groups")
+            lines.append(f"Scan B ({hash_b}):  {groups_b_count:,} groups")
+            lines.append(f"Delta:  {groups_b_count - groups_a_count:+,} groups\n")
+
+            if only_a:
+                lines.append(f"⚠ {len(only_a)} group(s) ONLY in {hash_a} (likely false positives):")
+                for g in only_a[:50]:
+                    lines.append(f"  Group {g.get('index', '?')} — {g.get('file_count', '?')} files · {g.get('each_size_h', '?')} each")
+                    for ff in g.get("files", [])[:5]:
+                        lines.append(f"    → {ff.get('name', '')}  —  {ff.get('path', '')}")
+                lines.append("")
+
+            if only_b:
+                lines.append(f"ℹ {len(only_b)} group(s) ONLY in {hash_b}:")
+                for g in only_b[:50]:
+                    lines.append(f"  Group {g.get('index', '?')} — {g.get('file_count', '?')} files · {g.get('each_size_h', '?')} each")
+                    for ff in g.get("files", [])[:5]:
+                        lines.append(f"    → {ff.get('name', '')}  —  {ff.get('path', '')}")
+                lines.append("")
+
+            if not only_a and not only_b:
+                lines.append("✅ Both scans found identical duplicate groups!")
+
+            result = "\n".join(lines)
+
+            # Show in a scrollable dialog
+            from PyQt6.QtWidgets import QDialog, QTextEdit, QDialogButtonBox
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Compare Reports")
+            dlg.resize(900, 600)
+            layout = QVBoxLayout(dlg)
+            text = QTextEdit()
+            text.setReadOnly(True)
+            text.setPlainText(result)
+            text.setStyleSheet("font-family: monospace; font-size: 12px;")
+            layout.addWidget(text)
+            bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+            bb.accepted.connect(dlg.accept)
+            layout.addWidget(bb)
+            dlg.exec()
+
+        except Exception as exc:
+            QMessageBox.critical(self, "Compare error", str(exc))
 
     # ---------------------------------------------- deletion
     def _delete_selected(self):

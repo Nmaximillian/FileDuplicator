@@ -14,6 +14,10 @@ let eventSource = null;
 let loadedGroupCount = 0;
 let totalGroupCount = 0;
 let summaryData = null;
+let currentSort = "size_desc";
+let currentSearch = "";
+let scanStartTime = null;    // for elapsed timer
+let elapsedInterval = null;
 const PAGE_SIZE = 50;
 
 // ── DOM refs ──
@@ -43,6 +47,42 @@ $("#exportCsvBtn").addEventListener("click", (e) => { e.preventDefault(); export
 $("#exportJsonBtn").addEventListener("click", (e) => { e.preventDefault(); exportReport("json"); });
 loadMoreBtn.addEventListener("click", loadMore);
 
+// Sort & search
+const sortSelect = $("#sortSelect");
+const searchInput = $("#searchInput");
+const filterInfo = $("#filterInfo");
+let searchDebounce = null;
+
+sortSelect.addEventListener("change", () => {
+    currentSort = sortSelect.value;
+    reloadResults();
+});
+
+searchInput.addEventListener("input", () => {
+    clearTimeout(searchDebounce);
+    searchDebounce = setTimeout(() => {
+        currentSearch = searchInput.value.trim();
+        reloadResults();
+    }, 400);
+});
+
+$("#searchClearBtn").addEventListener("click", () => {
+    searchInput.value = "";
+    currentSearch = "";
+    reloadResults();
+});
+
+// Compare
+$("#compareBtn").addEventListener("click", openCompareModal);
+$("#runCompareBtn").addEventListener("click", runCompare);
+
+function reloadResults() {
+    if (!currentJobId) return;
+    groupsContainer.innerHTML = "";
+    loadedGroupCount = 0;
+    loadGroups(currentJobId, 0);
+}
+
 async function startScan() {
     const root = dirInput.value.trim();
     if (!root) return alert("Enter a directory path.");
@@ -56,9 +96,17 @@ async function startScan() {
     loadedGroupCount = 0;
     totalGroupCount = 0;
     summaryData = null;
+    currentSearch = "";
+    searchInput.value = "";
+    sortSelect.value = "size_desc";
+    currentSort = "size_desc";
     progressBar.style.width = "0%";
     phaseLabel.textContent = "";
     progressText.textContent = "";
+
+    // Start elapsed timer
+    scanStartTime = Date.now();
+    startElapsedTimer();
 
     const body = {
         root,
@@ -145,10 +193,19 @@ async function tryReconnect() {
 
 tryReconnect();
 
+let sseRetries = 0;
+const MAX_SSE_RETRIES = 50;  // ~50 retries × 3s = ~2.5 min of retrying
+
 function pollProgress(jobId) {
     if (eventSource) eventSource.close();
+    sseRetries = 0;
+    _connectSSE(jobId);
+}
+
+function _connectSSE(jobId) {
     eventSource = new EventSource(`/api/scan/${jobId}/progress`);
     eventSource.onmessage = (ev) => {
+        sseRetries = 0;  // reset on any successful message
         const d = JSON.parse(ev.data);
 
         phaseLabel.textContent = d.phase || "";
@@ -165,6 +222,7 @@ function pollProgress(jobId) {
 
         if (d.status === "done") {
             eventSource.close();
+            stopElapsedTimer();
             summaryData = d.summary;
             totalGroupCount = d.summary.group_count;
             phaseLabel.textContent = `Done · ${totalGroupCount.toLocaleString()} duplicate groups`;
@@ -182,8 +240,18 @@ function pollProgress(jobId) {
     };
     eventSource.onerror = () => {
         eventSource.close();
-        scanBtn.disabled = false;
-        cancelBtn.disabled = true;
+        sseRetries++;
+        if (sseRetries <= MAX_SSE_RETRIES) {
+            // Connection dropped (common in long scans) — reconnect after a short delay
+            console.warn(`SSE connection lost, retrying (${sseRetries}/${MAX_SSE_RETRIES})…`);
+            phaseLabel.textContent += " (reconnecting…)";
+            setTimeout(() => _connectSSE(jobId), 3000);
+        } else {
+            // Truly lost — but the scan may still be running server-side
+            phaseLabel.textContent = "Connection lost — refresh the page to check results.";
+            scanBtn.disabled = false;
+            cancelBtn.disabled = true;
+        }
     };
 }
 
@@ -199,8 +267,9 @@ async function cancelScan() {
 // ── Summary ──
 function showSummary(s) {
     resultsArea.classList.remove("d-none");
+    stopElapsedTimer();
 
-    // Scan stats bar (total files scanned, hash algo)
+    // Scan stats bar (total files scanned, hash algo, elapsed, timestamp)
     const statsBar = $("#scanStatsBar");
     statsBar.classList.remove("d-none");
     let statsHtml = `
@@ -211,6 +280,13 @@ function showSummary(s) {
     `;
     if (s.cloud_skipped > 0) {
         statsHtml += ` &nbsp;•&nbsp; ${s.cloud_skipped.toLocaleString()} cloud files skipped`;
+    }
+    if (s.elapsed_h) {
+        statsHtml += ` &nbsp;•&nbsp; <i class="bi bi-stopwatch"></i> ${s.elapsed_h}`;
+    }
+    if (s.finished_at) {
+        const d = new Date(s.finished_at);
+        statsHtml += ` &nbsp;•&nbsp; <i class="bi bi-clock"></i> ${d.toLocaleString()}`;
     }
     statsBar.innerHTML = statsHtml;
 
@@ -229,7 +305,12 @@ async function loadGroups(jobId, offset) {
         loadMoreBtn.disabled = true;
         loadMoreBtn.innerHTML = `<span class="spinner-border spinner-border-sm me-1"></span> Loading…`;
 
-        const res = await fetch(`/api/scan/${jobId}/groups?offset=${offset}&limit=${PAGE_SIZE}`);
+        const params = new URLSearchParams({
+            offset: String(offset), limit: String(PAGE_SIZE),
+            sort: currentSort,
+        });
+        if (currentSearch) params.set("search", currentSearch);
+        const res = await fetch(`/api/scan/${jobId}/groups?${params}`);
         const data = await res.json();
         if (data.error) throw new Error(data.error);
 
@@ -249,6 +330,13 @@ async function loadGroups(jobId, offset) {
         } else {
             loadMoreArea.classList.add("d-none");
             loadMoreInfo.textContent = "";
+        }
+
+        // Update filter info
+        if (currentSearch) {
+            filterInfo.textContent = `Showing ${data.total.toLocaleString()} matching groups`;
+        } else {
+            filterInfo.textContent = "";
         }
     } catch (e) {
         alert("Failed to load groups: " + e.message);
@@ -757,4 +845,128 @@ function escHtml(s) {
     const d = document.createElement("div");
     d.textContent = s;
     return d.innerHTML;
+}
+
+// ── Elapsed timer ──
+function startElapsedTimer() {
+    stopElapsedTimer();
+    elapsedInterval = setInterval(() => {
+        if (!scanStartTime) return;
+        const sec = Math.floor((Date.now() - scanStartTime) / 1000);
+        progressText.textContent = progressText.textContent.replace(/ +\|.*/, "") +
+            " | " + formatElapsed(sec);
+    }, 1000);
+}
+
+function stopElapsedTimer() {
+    if (elapsedInterval) {
+        clearInterval(elapsedInterval);
+        elapsedInterval = null;
+    }
+}
+
+function formatElapsed(sec) {
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    if (h > 0) return `${h}h ${m}m ${s}s`;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+}
+
+// ── Compare scans ──
+async function openCompareModal() {
+    try {
+        const res = await fetch("/api/jobs");
+        const jobs = await res.json();
+        const done = jobs.filter((j) => j.status === "done");
+
+        const selA = $("#compareJobA");
+        const selB = $("#compareJobB");
+        selA.innerHTML = "";
+        selB.innerHTML = "";
+
+        for (const j of done) {
+            const label = `${j.root} · ${j.elapsed_h || "?"} · ${j.group_count.toLocaleString()} groups (${j.id})`;
+            selA.innerHTML += `<option value="${j.id}">${escHtml(label)}</option>`;
+            selB.innerHTML += `<option value="${j.id}">${escHtml(label)}</option>`;
+        }
+
+        // Pre-select different jobs if possible
+        if (done.length >= 2) {
+            selA.selectedIndex = 0;
+            selB.selectedIndex = 1;
+        }
+
+        $("#compareResults").classList.add("d-none");
+        new bootstrap.Modal($("#compareModal")).show();
+    } catch (e) {
+        alert("Failed to load jobs: " + e.message);
+    }
+}
+
+async function runCompare() {
+    const jobA = $("#compareJobA").value;
+    const jobB = $("#compareJobB").value;
+    if (!jobA || !jobB) return alert("Select two scans.");
+    if (jobA === jobB) return alert("Select two different scans.");
+
+    const btn = $("#runCompareBtn");
+    btn.disabled = true;
+    btn.innerHTML = `<span class="spinner-border spinner-border-sm me-1"></span> Comparing…`;
+
+    try {
+        const res = await fetch("/api/compare", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ job_a: jobA, job_b: jobB }),
+        });
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+
+        // Build summary table
+        let html = `<table class="table table-sm table-dark table-bordered">
+            <thead><tr><th></th><th>Scan A (${escHtml(data.job_a.hash)})</th><th>Scan B (${escHtml(data.job_b.hash)})</th><th>Delta</th></tr></thead>
+            <tbody>
+            <tr><td>Groups</td><td>${data.job_a.groups.toLocaleString()}</td><td>${data.job_b.groups.toLocaleString()}</td>
+                <td class="${data.job_a.groups !== data.job_b.groups ? "text-warning" : ""}">${(data.job_b.groups - data.job_a.groups).toLocaleString()}</td></tr>
+            <tr><td>Files</td><td>${data.job_a.files.toLocaleString()}</td><td>${data.job_b.files.toLocaleString()}</td>
+                <td class="${data.job_a.files !== data.job_b.files ? "text-warning" : ""}">${(data.job_b.files - data.job_a.files).toLocaleString()}</td></tr>
+            <tr><td>Reclaimable</td><td>${data.job_a.reclaimable}</td><td>${data.job_b.reclaimable}</td><td>—</td></tr>
+            </tbody></table>`;
+
+        if (data.only_in_a_count > 0) {
+            html += `<h6 class="text-warning mt-3">⚠ ${data.only_in_a_count} group(s) only in Scan A (${escHtml(data.job_a.hash)}) — likely false positives:</h6>`;
+            html += buildCompareGroupList(data.only_in_a);
+        }
+        if (data.only_in_b_count > 0) {
+            html += `<h6 class="text-info mt-3">ℹ ${data.only_in_b_count} group(s) only in Scan B (${escHtml(data.job_b.hash)}):</h6>`;
+            html += buildCompareGroupList(data.only_in_b);
+        }
+        if (data.only_in_a_count === 0 && data.only_in_b_count === 0) {
+            html += `<div class="alert alert-success mt-3"><i class="bi bi-check-circle"></i> Both scans found identical duplicate groups!</div>`;
+        }
+
+        $("#compareSummary").innerHTML = html;
+        $("#compareResults").classList.remove("d-none");
+    } catch (e) {
+        alert("Compare failed: " + e.message);
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = `<i class="bi bi-arrow-left-right"></i> Compare`;
+    }
+}
+
+function buildCompareGroupList(groups) {
+    let html = `<div style="max-height:400px;overflow-y:auto">`;
+    for (const g of groups) {
+        html += `<div class="card bg-dark border-secondary mb-2"><div class="card-body py-2 px-3">`;
+        html += `<strong>Group ${g.index}</strong> — ${g.file_count} files · ${g.each_size_h} each<br>`;
+        for (const f of g.files) {
+            html += `<small class="text-muted d-block ms-3">${escHtml(f.name)} — ${escHtml(f.path)}</small>`;
+        }
+        html += `</div></div>`;
+    }
+    html += `</div>`;
+    return html;
 }

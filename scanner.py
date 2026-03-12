@@ -30,8 +30,11 @@ import hashlib
 PARTIAL_CHUNK = 64 * 1024        # 64 KB for partial hash
 FULL_CHUNK    = 4 * 1024 * 1024  # 4 MB read buffer for full hash
 HASH_BATCH    = 5_000            # files per parallel batch
-BATCH_TIMEOUT_PER_FILE = 0.1     # seconds budget per file in a batch
 BATCH_TIMEOUT_MIN = 120          # minimum batch timeout (seconds)
+# Timeout scales with total data in the batch:
+#   100 MB/s is conservative for SHA-256 on NAS SSDs.
+#   Applied per-worker, so total batch throughput = workers × this rate.
+BATCH_TIMEOUT_RATE = 100 * 1024 * 1024  # bytes/sec assumed throughput per worker
 
 # Directories to always skip (case-insensitive on Windows)
 SKIP_DIRS: set[str] = {
@@ -238,7 +241,12 @@ def _parallel_hash_phase(
             return skipped
 
         batch = files[batch_start : batch_start + HASH_BATCH]
-        batch_timeout = max(BATCH_TIMEOUT_MIN, len(batch) * BATCH_TIMEOUT_PER_FILE)
+        # Timeout scales with the total bytes in this batch so large
+        # files (1 GB+) get enough time even with slower algorithms.
+        batch_bytes = sum(fe.size for fe in batch)
+        bytes_per_worker = batch_bytes / max(workers, 1)
+        size_timeout = (bytes_per_worker / BATCH_TIMEOUT_RATE) * 2  # 2× safety
+        batch_timeout = max(BATCH_TIMEOUT_MIN, size_timeout)
 
         pool = ThreadPoolExecutor(max_workers=workers)
         futs = {pool.submit(hash_fn, fe.path): fe for fe in batch}
