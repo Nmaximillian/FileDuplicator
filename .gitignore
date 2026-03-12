@@ -6,10 +6,10 @@ __pycache__/
 venv/
 *.egg-info/
 
-# PyInstaller
+# PyInstaller build artifacts (rebuild with: pyinstaller FileDuplicator.spec)
 build/
-dist/
-*.spec
+dist/*
+!dist/FileDuplicator.exe
 
 # IDE
 .vscode/
