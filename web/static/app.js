@@ -20,6 +20,43 @@ let scanStartTime = null;    // for elapsed timer
 let elapsedInterval = null;
 const PAGE_SIZE = 50;
 
+// ── Multi-directory helpers ──
+const scanDirs = [];   // list of selected directories
+const dirList = null;  // populated after DOM refs
+
+function renderDirList() {
+    const el = $("#dirList");
+    if (!el) return;
+    el.innerHTML = "";
+    if (scanDirs.length === 0) {
+        el.innerHTML = '<div class="list-group-item bg-dark text-muted py-1" style="font-size:.85rem">(no directories added yet)</div>';
+        return;
+    }
+    scanDirs.forEach((d, i) => {
+        const item = document.createElement("div");
+        item.className = "list-group-item bg-dark text-light d-flex align-items-center py-1";
+        item.style.fontSize = ".85rem";
+        item.innerHTML = `<i class="bi bi-folder-fill text-warning me-2"></i>
+            <span class="flex-grow-1 text-truncate">${escHtml(d)}</span>
+            <button class="btn btn-sm btn-outline-danger ms-2 py-0 px-1" title="Remove">
+                <i class="bi bi-x-lg"></i>
+            </button>`;
+        item.querySelector("button").addEventListener("click", () => {
+            scanDirs.splice(i, 1);
+            renderDirList();
+        });
+        el.appendChild(item);
+    });
+}
+
+function addDirectory(path) {
+    const p = path.trim();
+    if (!p) return;
+    if (scanDirs.includes(p)) return;  // no duplicates
+    scanDirs.push(p);
+    renderDirList();
+}
+
 // ── DOM refs ──
 const $ = (sel) => document.querySelector(sel);
 const dirInput = $("#dirInput");
@@ -46,6 +83,20 @@ $("#confirmDeleteBtn").addEventListener("click", doDelete);
 $("#exportCsvBtn").addEventListener("click", (e) => { e.preventDefault(); exportReport("csv"); });
 $("#exportJsonBtn").addEventListener("click", (e) => { e.preventDefault(); exportReport("json"); });
 loadMoreBtn.addEventListener("click", loadMore);
+
+// Multi-directory buttons
+$("#addDirBtn").addEventListener("click", () => {
+    addDirectory(dirInput.value);
+    dirInput.value = "";
+});
+dirInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { addDirectory(dirInput.value); dirInput.value = ""; }
+});
+$("#clearDirsBtn").addEventListener("click", () => {
+    scanDirs.length = 0;
+    renderDirList();
+});
+renderDirList();  // initial render
 
 // Sort & search
 const sortSelect = $("#sortSelect");
@@ -84,8 +135,7 @@ function reloadResults() {
 }
 
 async function startScan() {
-    const root = dirInput.value.trim();
-    if (!root) return alert("Enter a directory path.");
+    if (scanDirs.length === 0) return alert("Add at least one directory.");
 
     scanBtn.disabled = true;
     cancelBtn.disabled = false;
@@ -109,7 +159,7 @@ async function startScan() {
     startElapsedTimer();
 
     const body = {
-        root,
+        roots: [...scanDirs],
         by_name: $("#chkName").checked,
         by_size: $("#chkSize").checked,
         by_hash: $("#chkHash").checked,
@@ -151,7 +201,11 @@ async function tryReconnect() {
 
         if (job.status === "running") {
             // Scan is still running – reconnect to SSE
-            if (job.root) dirInput.value = job.root;
+            if (job.roots && job.roots.length) {
+                scanDirs.length = 0;
+                job.roots.forEach(r => scanDirs.push(r));
+                renderDirList();
+            }
             scanBtn.disabled = true;
             cancelBtn.disabled = false;
             progressArea.classList.remove("d-none");
@@ -159,7 +213,11 @@ async function tryReconnect() {
             pollProgress(savedId);
         } else if (job.status === "done") {
             // Scan finished while we were away – show results
-            if (job.root) dirInput.value = job.root;
+            if (job.roots && job.roots.length) {
+                scanDirs.length = 0;
+                job.roots.forEach(r => scanDirs.push(r));
+                renderDirList();
+            }
             const progRes = await fetch(`/api/scan/${savedId}/progress`);
             // Read the SSE stream for summary
             const reader = progRes.body.getReader();
@@ -786,7 +844,8 @@ $("#browsePathInput").addEventListener("keydown", (e) => {
 });
 
 $("#browseSelectBtn").addEventListener("click", () => {
-    dirInput.value = browseCurrent;
+    addDirectory(browseCurrent);
+    dirInput.value = "";
     browseModal.hide();
 });
 
@@ -887,7 +946,7 @@ async function openCompareModal() {
         selB.innerHTML = "";
 
         for (const j of done) {
-            const label = `${j.root} · ${j.elapsed_h || "?"} · ${j.group_count.toLocaleString()} groups (${j.id})`;
+            const label = `${j.root || "(multi)"} · ${j.elapsed_h || "?"} · ${j.group_count.toLocaleString()} groups (${j.id})`;
             selA.innerHTML += `<option value="${j.id}">${escHtml(label)}</option>`;
             selB.innerHTML += `<option value="${j.id}">${escHtml(label)}</option>`;
         }

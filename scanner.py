@@ -296,7 +296,7 @@ def _parallel_hash_phase(
 # ---------------------------------------------------------------------------
 
 def scan_directory(
-    root: str,
+    root: str | list[str],
     *,
     by_name: bool = False,
     by_size: bool = True,
@@ -309,10 +309,12 @@ def scan_directory(
     extra_skip_dirs: set[str] | None = None,
 ) -> tuple[list[DuplicateGroup], ScanStats]:
     """
-    Scan *root* for duplicate files.
+    Scan one or more directories for duplicate files.
 
+    *root* may be a single path string or a list of path strings.
     Returns (groups, stats) where groups is sorted by wasted space (largest first).
     """
+    roots = [root] if isinstance(root, str) else list(root)
     _progress = progress or (lambda *_: None)
     _cancelled = cancelled or (lambda: False)
     skip = SKIP_DIRS | (extra_skip_dirs or set())
@@ -323,35 +325,41 @@ def scan_directory(
     # ------------------------------------------------------------------
     # Phase 1 – enumerate files
     # ------------------------------------------------------------------
-    _progress("Phase 1 · Enumerating files…", 0, 0)
+    all_files: list[FileEntry] = []
+    cloud_skipped = 0
+    for idx, scan_root in enumerate(roots, 1):
+        prefix = f"Phase 1 · [{idx}/{len(roots)}] " if len(roots) > 1 else "Phase 1 · "
+        _progress(f"{prefix}Enumerating files…", 0, 0)
+        if _cancelled():
+            return [], stats
 
-    if recursive:
-        all_files, cloud_skipped = _walk_fast(root, min_size, skip, _cancelled, _progress)
-    else:
-        all_files = []
-        cloud_skipped = 0
-        try:
-            with os.scandir(root) as it:
-                for entry in it:
-                    if _cancelled():
-                        return []
-                    try:
-                        if entry.is_file(follow_symlinks=False):
-                            st = entry.stat(follow_symlinks=False)
-                            if _is_cloud_file(st):
-                                cloud_skipped += 1
-                                continue
-                            if st.st_size >= min_size:
-                                all_files.append(FileEntry(
-                                    path=entry.path,
-                                    name=entry.name,
-                                    size=st.st_size,
-                                    mtime=st.st_mtime,
-                                ))
-                    except (OSError, PermissionError):
-                        continue
-        except (OSError, PermissionError):
-            pass
+        if recursive:
+            root_files, root_cloud = _walk_fast(scan_root, min_size, skip, _cancelled, _progress)
+            all_files.extend(root_files)
+            cloud_skipped += root_cloud
+        else:
+            try:
+                with os.scandir(scan_root) as it:
+                    for entry in it:
+                        if _cancelled():
+                            return [], stats
+                        try:
+                            if entry.is_file(follow_symlinks=False):
+                                st = entry.stat(follow_symlinks=False)
+                                if _is_cloud_file(st):
+                                    cloud_skipped += 1
+                                    continue
+                                if st.st_size >= min_size:
+                                    all_files.append(FileEntry(
+                                        path=entry.path,
+                                        name=entry.name,
+                                        size=st.st_size,
+                                        mtime=st.st_mtime,
+                                    ))
+                        except (OSError, PermissionError):
+                            continue
+            except (OSError, PermissionError):
+                pass
 
     total_files = len(all_files)
     total_size = sum(fe.size for fe in all_files)

@@ -38,6 +38,8 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -114,7 +116,7 @@ class ScanWorker(QThread):
 
     def __init__(
         self,
-        root: str,
+        roots: list[str],
         by_name: bool,
         by_size: bool,
         by_hash: bool,
@@ -123,7 +125,7 @@ class ScanWorker(QThread):
         use_sha256: bool = False,
     ):
         super().__init__()
-        self.root = root
+        self.roots = roots
         self.by_name = by_name
         self.by_size = by_size
         self.by_hash = by_hash
@@ -138,7 +140,7 @@ class ScanWorker(QThread):
     def run(self):
         try:
             groups, stats = scan_directory(
-                self.root,
+                self.roots,
                 by_name=self.by_name,
                 by_size=self.by_size,
                 by_hash=self.by_hash,
@@ -197,7 +199,7 @@ class MainWindow(QMainWindow):
         self._worker: ScanWorker | None = None
         self._groups: list[DuplicateGroup] = []   # ALL groups from scan
         self._stats: ScanStats | None = None       # last scan stats
-        self._scan_root: str = ""                   # directory that was scanned
+        self._scan_roots: list[str] = []            # directories that were scanned
         self._displayed: int = 0                   # how many groups are in the tree
         self._scan_start_time: float = 0.0          # monotonic start time
         self._scan_elapsed: float = 0.0             # elapsed seconds
@@ -213,15 +215,26 @@ class MainWindow(QMainWindow):
         root_layout = QVBoxLayout(central)
         root_layout.setContentsMargins(12, 12, 12, 12)
 
-        # --- Directory picker ---
-        dir_group = QGroupBox("Directory")
-        dir_layout = QHBoxLayout(dir_group)
-        self._dir_edit = QLineEdit()
-        self._dir_edit.setPlaceholderText("Choose a folder to scan…")
-        dir_layout.addWidget(self._dir_edit, 1)
-        self._browse_btn = QPushButton("Browse…")
-        self._browse_btn.clicked.connect(self._browse)
-        dir_layout.addWidget(self._browse_btn)
+        # --- Directory picker (multi-directory) ---
+        dir_group = QGroupBox("Directories")
+        dir_outer = QVBoxLayout(dir_group)
+        self._dir_list = QListWidget()
+        self._dir_list.setMaximumHeight(100)
+        self._dir_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self._dir_list.setAlternatingRowColors(True)
+        dir_outer.addWidget(self._dir_list)
+        dir_btn_row = QHBoxLayout()
+        self._add_dir_btn = QPushButton("Add…")
+        self._add_dir_btn.clicked.connect(self._browse_add)
+        dir_btn_row.addWidget(self._add_dir_btn)
+        self._remove_dir_btn = QPushButton("Remove selected")
+        self._remove_dir_btn.clicked.connect(self._remove_selected_dirs)
+        dir_btn_row.addWidget(self._remove_dir_btn)
+        self._clear_dirs_btn = QPushButton("Clear all")
+        self._clear_dirs_btn.clicked.connect(self._clear_dirs)
+        dir_btn_row.addWidget(self._clear_dirs_btn)
+        dir_btn_row.addStretch()
+        dir_outer.addLayout(dir_btn_row)
         root_layout.addWidget(dir_group)
 
         # --- Scan options ---
@@ -368,16 +381,20 @@ class MainWindow(QMainWindow):
     def _save_state(self):
         s = QSettings("FileDuplicator", "MainWindow")
         s.setValue("geometry", self.saveGeometry())
-        s.setValue("last_dir", self._dir_edit.text())
+        dirs = [self._dir_list.item(i).text() for i in range(self._dir_list.count())]
+        s.setValue("last_dirs", dirs)
 
     def _restore_state(self):
         s = QSettings("FileDuplicator", "MainWindow")
         geo = s.value("geometry")
         if geo:
             self.restoreGeometry(geo)
-        last = s.value("last_dir", "")
-        if last:
-            self._dir_edit.setText(last)
+        saved = s.value("last_dirs", [])
+        if isinstance(saved, str):
+            saved = [saved] if saved else []
+        for d in saved:
+            if d and os.path.isdir(d):
+                self._dir_list.addItem(d)
 
     def closeEvent(self, event):
         self._save_state()
@@ -387,10 +404,23 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     # ---------------------------------------------------------- slots
-    def _browse(self):
-        d = QFileDialog.getExistingDirectory(self, "Select directory", self._dir_edit.text())
+    def _browse_add(self):
+        start = ""
+        if self._dir_list.count():
+            start = self._dir_list.item(self._dir_list.count() - 1).text()
+        d = QFileDialog.getExistingDirectory(self, "Add directory", start)
         if d:
-            self._dir_edit.setText(d)
+            # Avoid duplicates
+            existing = {self._dir_list.item(i).text() for i in range(self._dir_list.count())}
+            if d not in existing:
+                self._dir_list.addItem(d)
+
+    def _remove_selected_dirs(self):
+        for item in reversed(self._dir_list.selectedItems()):
+            self._dir_list.takeItem(self._dir_list.row(item))
+
+    def _clear_dirs(self):
+        self._dir_list.clear()
 
     def _parse_min_size(self) -> int:
         text = self._min_size_combo.currentText()
@@ -403,9 +433,11 @@ class MainWindow(QMainWindow):
         return int(val * mult.get(unit, 1))
 
     def _start_scan(self):
-        root = self._dir_edit.text().strip()
-        if not root or not os.path.isdir(root):
-            QMessageBox.warning(self, "Invalid directory", "Please choose a valid directory.")
+        roots = [self._dir_list.item(i).text().strip()
+                 for i in range(self._dir_list.count())]
+        roots = [r for r in roots if r and os.path.isdir(r)]
+        if not roots:
+            QMessageBox.warning(self, "No directories", "Please add at least one valid directory.")
             return
         by_name = self._chk_name.isChecked()
         by_size = self._chk_size.isChecked()
@@ -417,7 +449,7 @@ class MainWindow(QMainWindow):
         self._tree.clear()
         self._groups.clear()
         self._stats = None
-        self._scan_root = root
+        self._scan_roots = roots
         self._displayed = 0
         self._progress.setValue(0)
         self._scan_btn.setEnabled(False)
@@ -429,7 +461,7 @@ class MainWindow(QMainWindow):
         self._scan_start_time = _time.monotonic()
 
         self._worker = ScanWorker(
-            root,
+            roots,
             by_name=by_name,
             by_size=by_size,
             by_hash=by_hash,
@@ -778,7 +810,7 @@ class MainWindow(QMainWindow):
             # Metadata header rows
             w.writerow(["# FileDuplicator Scan Report"])
             w.writerow(["# Date", datetime.now().isoformat()])
-            w.writerow(["# Directory", self._scan_root])
+            w.writerow(["# Directories", "; ".join(self._scan_roots)])
             if self._stats:
                 w.writerow(["# Hash Algorithm", self._stats.hash_algorithm])
                 w.writerow(["# Files Scanned", self._stats.total_files_scanned])
@@ -810,7 +842,7 @@ class MainWindow(QMainWindow):
         report = {
             "tool": "FileDuplicator",
             "export_date": datetime.now().isoformat(),
-            "scan_directory": self._scan_root,
+            "scan_directories": self._scan_roots,
             "stats": None,
             "groups": [],
         }
@@ -1139,7 +1171,7 @@ class MainWindow(QMainWindow):
                     "tool": "FileDuplicator",
                     "report_type": "deletion",
                     "deletion_date": datetime.now().isoformat(),
-                    "scan_directory": self._scan_root,
+                    "scan_directories": self._scan_roots,
                     "hash_algorithm": self._stats.hash_algorithm if self._stats else "",
                     "files_deleted": len(deleted_info),
                     "total_freed_bytes": sum(d["size"] for d in deleted_info),
@@ -1154,7 +1186,7 @@ class MainWindow(QMainWindow):
                     w = csv.writer(f)
                     w.writerow(["# FileDuplicator Deletion Report"])
                     w.writerow(["# Date", datetime.now().isoformat()])
-                    w.writerow(["# Directory", self._scan_root])
+                    w.writerow(["# Directories", "; ".join(self._scan_roots)])
                     w.writerow(["# Hash Algorithm", self._stats.hash_algorithm if self._stats else ""])
                     w.writerow(["# Files Deleted", len(deleted_info)])
                     w.writerow(["# Space Freed", _human_size(sum(d["size"] for d in deleted_info))])

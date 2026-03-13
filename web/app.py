@@ -81,7 +81,8 @@ def api_jobs():
                 "id": jid,
                 "status": j["status"],
                 "phase": j["phase"],
-                "root": j.get("root", ""),
+                "root": "; ".join(j.get("roots", [])),
+                "roots": j.get("roots", []),
                 "started_at": j.get("started_at", ""),
                 "group_count": j["summary"].get("group_count", 0) if j["summary"] else 0,
                 "finished_at": j.get("finished_at"),
@@ -113,9 +114,16 @@ def api_browse():
 def api_scan_start():
     """Start a scan job.  Returns a job ID for polling progress via SSE."""
     data = request.get_json(force=True)
-    root = data.get("root", "")
-    if not root or not os.path.isdir(root):
-        return jsonify({"error": "Invalid directory"}), 400
+
+    # Accept "roots" (list) or legacy "root" (string)
+    roots = data.get("roots", [])
+    if not roots:
+        single = data.get("root", "")
+        if single:
+            roots = [single]
+    roots = [r for r in roots if r and os.path.isdir(r)]
+    if not roots:
+        return jsonify({"error": "No valid directories provided"}), 400
 
     job_id = uuid.uuid4().hex[:12]
     job = {
@@ -128,7 +136,7 @@ def api_scan_start():
         "summary": {},
         "error": None,
         "cancelled": False,
-        "root": root,
+        "roots": roots,
         "started_at": datetime.now().isoformat(),
         "_start_time": _time.monotonic(),
         "finished_at": None,
@@ -157,7 +165,7 @@ def api_scan_start():
                 job["total"] = tot
 
             groups, stats = scan_directory(
-                root,
+                roots,
                 by_name=by_name,
                 by_size=by_size,
                 by_hash=by_hash,
@@ -433,6 +441,7 @@ def api_export_csv(job_id: str):
     w = csv.writer(buf)
     w.writerow(["# FileDuplicator Scan Report"])
     w.writerow(["# Date", datetime.now().isoformat()])
+    w.writerow(["# Directories", "; ".join(job.get("roots", []))])
     w.writerow(["# Hash Algorithm", summary.get("hash_algorithm", "")])
     w.writerow(["# Files Scanned", summary.get("total_scanned", "")])
     w.writerow(["# Total Size Scanned", summary.get("total_scanned_size_h", "")])

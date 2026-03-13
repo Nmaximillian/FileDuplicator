@@ -20,15 +20,24 @@
 
 <div class="container-fluid px-3 py-3">
 
-    <!-- Directory picker -->
+    <!-- Directory picker (multi-directory) -->
     <div class="card mb-3">
         <div class="card-body py-2">
-            <label class="form-label fw-bold mb-1">Directory</label>
-            <div class="input-group">
-                <input id="dirInput" type="text" class="form-control" placeholder="/data/NickRoot">
-                <button id="browseBtn" class="btn btn-outline-secondary" type="button">
-                    <i class="bi bi-folder2-open"></i> Browse
+            <label class="form-label fw-bold mb-1">Directories</label>
+            <div id="dirList" class="list-group list-group-flush mb-2" style="max-height:140px;overflow-y:auto">
+                <!-- populated by JS -->
+            </div>
+            <div class="d-flex gap-2">
+                <div class="input-group flex-grow-1">
+                    <input id="dirInput" type="text" class="form-control form-control-sm" placeholder="/data/NickRoot">
+                    <button id="browseBtn" class="btn btn-outline-secondary btn-sm" type="button">
+                        <i class="bi bi-folder2-open"></i> Browse
+                    </button>
+                </div>
+                <button id="addDirBtn" class="btn btn-primary btn-sm" type="button">
+                    <i class="bi bi-plus-lg"></i> Add
                 </button>
+                <button id="clearDirsBtn" class="btn btn-outline-danger btn-sm" type="button">Clear all</button>
             </div>
         </div>
     </div>
@@ -199,7 +208,7 @@
                 <div id="browseDirList" class="list-group list-group-flush" style="max-height:400px;overflow-y:auto"></div>
             </div>
             <div class="modal-footer py-2">
-                <button id="browseSelectBtn" class="btn btn-primary btn-sm">Select This Directory</button>
+                <button id="browseSelectBtn" class="btn btn-primary btn-sm"><i class="bi bi-plus-lg"></i> Add This Directory</button>
             </div>
         </div>
     </div>
