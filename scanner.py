@@ -142,11 +142,25 @@ def _make_full_hash(use_sha256: bool = False):
     return _full_hash
 
 
+# macOS: iCloud placeholder flags (UF_DATALESS / SF_DATALESS)
+_MAC_CLOUD_FLAGS = 0
+if sys.platform == "darwin":
+    _MAC_CLOUD_FLAGS = 0x0040 | 0x40000000  # UF_DATALESS | SF_DATALESS
+
+
 def _is_cloud_file(st) -> bool:
-    """Return True if the file is a cloud placeholder / offline file (Windows)."""
-    if _WIN_CLOUD_ATTRS:
+    """Return True if the file is a cloud placeholder / offline file.
+
+    Supports Windows (OneDrive / iCloud for Windows) and macOS (iCloud Drive).
+    On Linux there are no known cloud placeholder attributes.
+    """
+    if sys.platform == "win32" and _WIN_CLOUD_ATTRS:
         attrs = getattr(st, "st_file_attributes", 0)
         if attrs & _WIN_CLOUD_ATTRS:
+            return True
+    elif sys.platform == "darwin" and _MAC_CLOUD_FLAGS:
+        flags = getattr(st, "st_flags", 0)
+        if flags & _MAC_CLOUD_FLAGS:
             return True
     return False
 

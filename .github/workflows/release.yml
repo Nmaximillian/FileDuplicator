@@ -1,0 +1,132 @@
+# Build & publish release binaries for Windows and macOS.
+# Triggered when a version tag (v*.*.*) is pushed.
+#
+# Produces:
+#   - FileDuplicator.exe      (Windows x64)
+#   - FileDuplicator.dmg      (macOS universal – Intel + Apple Silicon)
+#
+# Both artifacts are uploaded to the GitHub Release automatically.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write        # needed to create/upload releases
+
+jobs:
+  # ======================================================================
+  # Windows build
+  # ======================================================================
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pillow
+
+      - name: Generate icon (.ico)
+        run: python -c "from generate_icon import generate_icon; generate_icon()"
+
+      - name: Build with PyInstaller
+        run: pyinstaller FileDuplicator.spec
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: dist/FileDuplicator.exe
+
+  # ======================================================================
+  # macOS build
+  # ======================================================================
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pillow
+
+      - name: Generate icons (.ico + .icns)
+        run: |
+          python -c "from generate_icon import generate_icon; generate_icon()"
+          python generate_icns.py
+
+      - name: Build with PyInstaller
+        run: pyinstaller FileDuplicator_macOS.spec
+
+      - name: Create DMG
+        run: |
+          # Create a DMG from the .app bundle
+          mkdir -p dmg_contents
+          cp -R dist/FileDuplicator.app dmg_contents/
+          # Create a symlink to /Applications for drag-and-drop install
+          ln -s /Applications dmg_contents/Applications
+          hdiutil create -volname "FileDuplicator" \
+            -srcfolder dmg_contents \
+            -ov -format UDZO \
+            dist/FileDuplicator.dmg
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: dist/FileDuplicator.dmg
+
+  # ======================================================================
+  # Create GitHub Release with both binaries
+  # ======================================================================
+  release:
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-exe
+          path: release-assets/
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-dmg
+          path: release-assets/
+
+      - name: Get tag name
+        id: tag
+        run: echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.TAG }}
+          name: "${{ steps.tag.outputs.TAG }}"
+          generate_release_notes: true
+          files: |
+            release-assets/FileDuplicator.exe
+            release-assets/FileDuplicator.dmg
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

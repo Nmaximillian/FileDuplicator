@@ -10,6 +10,7 @@ venv/
 build/
 dist/*
 !dist/FileDuplicator.exe
+!dist/FileDuplicator.dmg
 
 # IDE
 .vscode/

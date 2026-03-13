@@ -1,15 +1,28 @@
 # File Duplicator – Duplicate Finder
 
-A fast duplicate-file scanner and cleaner for large directory trees (8 TB+). Available as a **Windows desktop app** or a **web UI** you can run on a NAS via Docker.
+A fast duplicate-file scanner and cleaner for large directory trees (8 TB+). Available as a **Windows desktop app**, **macOS desktop app**, or a **web UI** you can run on a NAS via Docker.
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue) ![PyQt6](https://img.shields.io/badge/Desktop-PyQt6-green) ![Flask](https://img.shields.io/badge/Web-Flask-lightgrey) ![Docker](https://img.shields.io/badge/NAS-Docker-blue) ![xxhash](https://img.shields.io/badge/hash-xxHash%20%7C%20SHA--256-orange)
+
+### Platform Support
+
+![Windows](https://img.shields.io/badge/Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white) ![macOS](https://img.shields.io/badge/macOS-000000?style=for-the-badge&logo=apple&logoColor=white) ![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)
+
+| Platform | Download | How to install |
+|----------|----------|----------------|
+| **Windows** | `FileDuplicator.exe` | Download and double-click |
+| **macOS** | `FileDuplicator.dmg` | Open DMG → drag to Applications |
+| **Web / NAS** | Docker image | `docker compose up -d` |
 
 ---
 
 ## Running the App
 
 ### Option A – Windows desktop (`.exe`)
-Download or build `dist\FileDuplicator.exe` and double-click it. No Python needed.
+Download `FileDuplicator.exe` from the [latest release](../../releases/latest) and double-click it. No Python needed.
+
+### Option A2 – macOS desktop (`.dmg`)
+Download `FileDuplicator.dmg` from the [latest release](../../releases/latest), open it, and drag **FileDuplicator** to your Applications folder.
 
 ### Option B – Desktop from source
 ```bash
@@ -58,11 +71,23 @@ Inside the web UI, browse to `/data/volume1/...` to scan your files.
 > **Tip:** You can also deploy via **Portainer** (available in ADM's App Central).
 > Import the `docker-compose.yml` as a Stack.
 
-### Building the Windows executable
+### Building from source
+
+**Windows (.exe):**
 ```bash
-pip install pyinstaller
-pyinstaller --onefile --windowed --name "FileDuplicator" \
-  --icon "FileDuplicator.ico" --add-data "FileDuplicator.ico;." main.py
+pip install pyinstaller pillow
+python -c "from generate_icon import generate_icon; generate_icon()"
+pyinstaller FileDuplicator.spec
+# Output: dist/FileDuplicator.exe
+```
+
+**macOS (.app / .dmg):**
+```bash
+pip install pyinstaller pillow
+python -c "from generate_icon import generate_icon; generate_icon()"
+python generate_icns.py
+pyinstaller FileDuplicator_macOS.spec
+# Output: dist/FileDuplicator.app
 ```
 
 ---
@@ -74,7 +99,7 @@ pyinstaller --onefile --windowed --name "FileDuplicator" \
 - **Hash algorithm choice** – xxHash (xxh128) for speed or SHA-256 for cryptographic certainty
 - **Recursive or flat scan** – choose whether to walk subdirectories
 - **Minimum file size filter** – skip tiny files (0 B → 1 GB threshold)
-- **Cloud file detection** – automatically skips OneDrive / iCloud placeholder files on Windows
+- **Cloud file detection** – automatically skips OneDrive / iCloud placeholder files on Windows and macOS
 
 ### Performance (designed for 8 TB+)
 - **Progressive hashing** – groups by size → partial hash (first+last 64 KB) → full hash only on true collisions
@@ -94,11 +119,11 @@ pyinstaller --onefile --windowed --name "FileDuplicator" \
 - **Deletion log export** – after deleting, export a detailed log of what was removed
 - **Scan statistics** – total files scanned, size, cloud files skipped, hash algorithm, elapsed time, and timestamp
 
-### Desktop-only features
-- **Double-click** a file → opens Explorer with file selected
-- **Right-click context menu** → Show in Explorer / Open folder / Toggle KEEP-DELETE
+### Desktop-only features (Windows & macOS)
+- **Double-click** a file → opens Explorer (Windows) or Finder (macOS) with file selected
+- **Right-click context menu** → Show in Explorer/Finder / Open folder / Toggle KEEP-DELETE
 - **Compare JSON reports** – load two exported JSON files and diff them
-- **Custom `.ico` icon** in title bar, taskbar, and `.exe`
+- **Native icon** – `.ico` on Windows, `.icns` on macOS
 - **Remembers last directory** between sessions
 
 ### Web-only features
@@ -145,8 +170,12 @@ FileDuplicator/
 ├── requirements.txt         # Desktop dependencies (PyQt6, xxhash)
 ├── requirements-web.txt     # Web dependencies (Flask, gunicorn, xxhash)
 ├── FileDuplicator.ico       # App icon
-├── FileDuplicator.spec      # PyInstaller build configuration
+├── FileDuplicator.spec      # PyInstaller build config (Windows)
+├── FileDuplicator_macOS.spec # PyInstaller build config (macOS .app)
 ├── generate_icon.py         # Regenerate the .ico via Pillow
+├── generate_icns.py         # Regenerate the .icns via Pillow + iconutil (macOS)
+├── .github/workflows/
+│   └── release.yml          # Auto-build Windows + macOS on tag push
 ├── web/
 │   ├── app.py               # Flask server + REST API + SSE + compare
 │   ├── templates/

@@ -79,9 +79,11 @@ def _human_elapsed(seconds: float) -> str:
 
 
 def _icon_path() -> str:
+    ext = ".icns" if sys.platform == "darwin" else ".ico"
+    name = f"FileDuplicator{ext}"
     if getattr(sys, "_MEIPASS", None):
-        return os.path.join(sys._MEIPASS, "FileDuplicator.ico")
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "FileDuplicator.ico")
+        return os.path.join(sys._MEIPASS, name)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
 
 
 def _safe_mtime(path: str) -> float:
@@ -92,15 +94,24 @@ def _safe_mtime(path: str) -> float:
 
 
 def _open_in_explorer(file_path: str):
+    """Reveal the file in the platform file manager."""
     try:
-        subprocess.Popen(["explorer", "/select,", os.path.normpath(file_path)])
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", file_path])
+        else:
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(file_path)])
     except Exception:
         pass
 
 
 def _open_directory(file_path: str):
+    """Open the containing directory in the platform file manager."""
     try:
-        os.startfile(os.path.dirname(file_path))
+        folder = os.path.dirname(file_path)
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", folder])
+        else:
+            os.startfile(folder)
     except Exception:
         pass
 
@@ -685,7 +696,8 @@ class MainWindow(QMainWindow):
             return
 
         menu = QMenu(self)
-        act_reveal = menu.addAction("📂  Show in Explorer (select file)")
+        _fm = "Finder" if sys.platform == "darwin" else "Explorer"
+        act_reveal = menu.addAction(f"📂  Show in {_fm} (select file)")
         act_open_dir = menu.addAction("📁  Open containing folder")
         menu.addSeparator()
         if item.checkState(0) == Qt.CheckState.Checked:
