@@ -7,6 +7,7 @@ COPY requirements-web.txt .
 RUN pip install --no-cache-dir -r requirements-web.txt
 
 # Copy app code
+COPY version.py .
 COPY scanner.py .
 COPY web/ web/
 

@@ -156,6 +156,18 @@ body {
     margin: 4px 0;
 }
 
+/* Multi-select highlights */
+.group-selected {
+    outline: 2px solid #4fc3f7;
+    outline-offset: -2px;
+    background: rgba(79, 195, 247, 0.15) !important;
+}
+
+tr.row-selected {
+    outline: 1px solid #4fc3f7;
+    background: rgba(79, 195, 247, 0.12) !important;
+}
+
 /* Load more area */
 #loadMoreArea {
     border-top: 1px solid rgba(255,255,255,0.08);

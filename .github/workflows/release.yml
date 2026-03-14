@@ -76,6 +76,12 @@ jobs:
       - name: Build with PyInstaller
         run: pyinstaller FileDuplicator_macOS.spec
 
+      - name: Ad-hoc code sign
+        run: |
+          # Remove quarantine attribute and ad-hoc sign so Gatekeeper is less strict
+          xattr -cr dist/FileDuplicator.app
+          codesign --force --deep --sign - dist/FileDuplicator.app
+
       - name: Create DMG
         run: |
           # Create a DMG from the .app bundle

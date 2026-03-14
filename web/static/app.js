@@ -5,7 +5,7 @@
  *  - Paginated group loading (50 at a time) – no more browser crash
  *  - Group-level context menu: Mark All Delete / Keep All / Keep Oldest
  *  - Groups sorted by size descending (biggest waste first)
- *  - Lazy expand: first 3 groups expanded, rest collapsed
+ *  - All groups expanded by default
  */
 
 // ── State ──
@@ -19,6 +19,10 @@ let currentSearch = "";
 let scanStartTime = null;    // for elapsed timer
 let elapsedInterval = null;
 const PAGE_SIZE = 50;
+
+// ── Multi-select state ──
+let lastClickedRow = null;    // for shift+click range selection on file rows
+let selectedGroupDivs = [];   // selected group headers for bulk operations
 
 // ── Multi-directory helpers ──
 const scanDirs = [];   // list of selected directories
@@ -373,8 +377,7 @@ async function loadGroups(jobId, offset) {
         if (data.error) throw new Error(data.error);
 
         for (const g of data.groups) {
-            const expand = loadedGroupCount < 3; // first 3 expanded
-            groupsContainer.appendChild(buildGroup(g, expand));
+            groupsContainer.appendChild(buildGroup(g, true));  // all groups expanded
             loadedGroupCount++;
         }
 
@@ -427,6 +430,17 @@ function buildGroup(group, expanded) {
     header.addEventListener("click", (e) => {
         // Don't toggle if right-click handled
         if (e.button !== 0) return;
+        // Ctrl/Cmd+click or Shift+click: toggle group selection instead of expand
+        if (e.ctrlKey || e.metaKey) {
+            e.preventDefault();
+            toggleGroupSelection(div);
+            return;
+        }
+        if (e.shiftKey) {
+            e.preventDefault();
+            shiftSelectGroups(div);
+            return;
+        }
         const body = div.querySelector(".dup-group-body");
         const icon = header.querySelector(".toggle-icon");
         if (body.style.display === "none") {
@@ -500,7 +514,32 @@ function buildGroup(group, expanded) {
         const tr = e.target.closest("tr[data-path]");
         if (!tr) return;
         e.preventDefault();
-        showFileContextMenu(e.clientX, e.clientY, tr);
+        // If right-clicked row is not in current selection, select just it
+        if (!tr.classList.contains("row-selected")) {
+            clearRowSelection();
+            tr.classList.add("row-selected");
+        }
+        const selectedRows = Array.from(body.closest("#groupsContainer")
+            .querySelectorAll("tr.row-selected[data-path]"));
+        showFileContextMenu(e.clientX, e.clientY, tr, selectedRows);
+    });
+
+    // Left-click on file rows: selection (Ctrl/Shift)
+    body.addEventListener("click", (e) => {
+        const tr = e.target.closest("tr[data-path]");
+        if (!tr) return;
+        // Ignore clicks on checkboxes themselves
+        if (e.target.tagName === "INPUT") return;
+        if (e.ctrlKey || e.metaKey) {
+            tr.classList.toggle("row-selected");
+            lastClickedRow = tr;
+        } else if (e.shiftKey && lastClickedRow) {
+            selectRowRange(lastClickedRow, tr);
+        } else {
+            clearRowSelection();
+            tr.classList.add("row-selected");
+            lastClickedRow = tr;
+        }
     });
 
     return div;
@@ -510,23 +549,32 @@ function buildGroup(group, expanded) {
 function showGroupContextMenu(x, y, groupDiv) {
     removeContextMenu();
 
+    // If right-clicked group is not selected, select just it
+    if (!selectedGroupDivs.includes(groupDiv)) {
+        clearGroupSelection();
+        selectGroup(groupDiv);
+    }
+    const targets = selectedGroupDivs.length > 0 ? [...selectedGroupDivs] : [groupDiv];
+    const n = targets.length;
+    const suffix = n > 1 ? ` (${n} groups)` : "";
+
     const menu = document.createElement("div");
     menu.className = "ctx-menu";
     menu.style.left = x + "px";
     menu.style.top = y + "px";
 
     // Mark ALL as DELETE
-    const delAll = menuItem("bi-trash3", "Mark ALL as DELETE", "text-danger");
+    const delAll = menuItem("bi-trash3", `Mark ALL as DELETE${suffix}`, "text-danger");
     delAll.addEventListener("click", () => {
-        setGroupAction(groupDiv, "delete");
+        targets.forEach(g => setGroupAction(g, "delete"));
         removeContextMenu();
     });
     menu.appendChild(delAll);
 
     // Mark ALL as KEEP
-    const keepAll = menuItem("bi-check-circle", "Mark ALL as KEEP", "text-success");
+    const keepAll = menuItem("bi-check-circle", `Mark ALL as KEEP${suffix}`, "text-success");
     keepAll.addEventListener("click", () => {
-        setGroupAction(groupDiv, "keep");
+        targets.forEach(g => setGroupAction(g, "keep"));
         removeContextMenu();
     });
     menu.appendChild(keepAll);
@@ -534,34 +582,40 @@ function showGroupContextMenu(x, y, groupDiv) {
     menu.appendChild(menuSep());
 
     // Keep oldest, delete rest
-    const keepOldest = menuItem("bi-clock-history", "Keep oldest, delete rest", "text-warning");
+    const keepOldest = menuItem("bi-clock-history", `Keep oldest, delete rest${suffix}`, "text-warning");
     keepOldest.addEventListener("click", () => {
-        setGroupKeepOldest(groupDiv);
+        targets.forEach(g => setGroupKeepOldest(g));
         removeContextMenu();
     });
     menu.appendChild(keepOldest);
 
     menu.appendChild(menuSep());
 
-    // Expand / Collapse
-    const body = groupDiv.querySelector(".dup-group-body");
-    const isExpanded = body && body.style.display !== "none";
-    const toggleItem = menuItem(
-        isExpanded ? "bi-arrows-collapse" : "bi-arrows-expand",
-        isExpanded ? "Collapse group" : "Expand group"
-    );
-    toggleItem.addEventListener("click", () => {
-        const icon = groupDiv.querySelector(".toggle-icon");
-        if (isExpanded) {
-            body.style.display = "none";
-            icon.className = "bi bi-chevron-right toggle-icon";
-        } else {
-            body.style.display = "";
-            icon.className = "bi bi-chevron-down toggle-icon";
-        }
+    // Expand all
+    const expandItem = menuItem("bi-arrows-expand", `Expand${suffix}`);
+    expandItem.addEventListener("click", () => {
+        targets.forEach(g => {
+            const body = g.querySelector(".dup-group-body");
+            const icon = g.querySelector(".toggle-icon");
+            if (body) body.style.display = "";
+            if (icon) icon.className = "bi bi-chevron-down toggle-icon";
+        });
         removeContextMenu();
     });
-    menu.appendChild(toggleItem);
+    menu.appendChild(expandItem);
+
+    // Collapse all
+    const collapseItem = menuItem("bi-arrows-collapse", `Collapse${suffix}`);
+    collapseItem.addEventListener("click", () => {
+        targets.forEach(g => {
+            const body = g.querySelector(".dup-group-body");
+            const icon = g.querySelector(".toggle-icon");
+            if (body) body.style.display = "none";
+            if (icon) icon.className = "bi bi-chevron-right toggle-icon";
+        });
+        removeContextMenu();
+    });
+    menu.appendChild(collapseItem);
 
     document.body.appendChild(menu);
     adjustMenuPosition(menu);
@@ -588,17 +642,19 @@ function setGroupKeepOldest(groupDiv) {
 }
 
 // ── File context menu (right-click on row) ──
-function showFileContextMenu(x, y, tr) {
+function showFileContextMenu(x, y, tr, selectedRows) {
     removeContextMenu();
     const path = tr.dataset.path;
-    const cb = tr.querySelector(".dup-check");
+    const targets = selectedRows && selectedRows.length > 1 ? selectedRows : [tr];
+    const n = targets.length;
+    const suffix = n > 1 ? ` (${n} files)` : "";
 
     const menu = document.createElement("div");
     menu.className = "ctx-menu";
     menu.style.left = x + "px";
     menu.style.top = y + "px";
 
-    // Copy full path
+    // Copy full path (always single item)
     const copyItem = menuItem("bi-clipboard", "Copy full path");
     copyItem.addEventListener("click", () => {
         navigator.clipboard.writeText(path).catch(() => {});
@@ -606,7 +662,7 @@ function showFileContextMenu(x, y, tr) {
     });
     menu.appendChild(copyItem);
 
-    // Copy directory
+    // Copy directory (always single item)
     const dir = path.substring(0, path.lastIndexOf("/")) || path.substring(0, path.lastIndexOf("\\"));
     const copyDirItem = menuItem("bi-folder", "Copy directory path");
     copyDirItem.addEventListener("click", () => {
@@ -617,20 +673,27 @@ function showFileContextMenu(x, y, tr) {
 
     menu.appendChild(menuSep());
 
-    // Toggle keep/delete
-    if (cb) {
-        const isChecked = cb.checked;
-        const toggleItem = menuItem(
-            isChecked ? "bi-check-circle" : "bi-trash3",
-            isChecked ? "Mark as KEEP" : "Mark as DELETE"
-        );
-        toggleItem.addEventListener("click", () => {
-            cb.checked = !isChecked;
-            cb.dispatchEvent(new Event("change"));
-            removeContextMenu();
+    // Mark as KEEP (all selected)
+    const keepItem = menuItem("bi-check-circle", `Mark as KEEP${suffix}`, "text-success");
+    keepItem.addEventListener("click", () => {
+        targets.forEach(r => {
+            const cb = r.querySelector(".dup-check");
+            if (cb) { cb.checked = false; cb.dispatchEvent(new Event("change")); }
         });
-        menu.appendChild(toggleItem);
-    }
+        removeContextMenu();
+    });
+    menu.appendChild(keepItem);
+
+    // Mark as DELETE (all selected)
+    const delItem = menuItem("bi-trash3", `Mark as DELETE${suffix}`, "text-danger");
+    delItem.addEventListener("click", () => {
+        targets.forEach(r => {
+            const cb = r.querySelector(".dup-check");
+            if (cb) { cb.checked = true; cb.dispatchEvent(new Event("change")); }
+        });
+        removeContextMenu();
+    });
+    menu.appendChild(delItem);
 
     document.body.appendChild(menu);
     adjustMenuPosition(menu);
@@ -890,6 +953,75 @@ async function browseTo(path) {
         alert("Browse error: " + e.message);
     }
 }
+
+// ── Multi-select helpers ──
+
+// --- Group selection ---
+function selectGroup(groupDiv) {
+    if (!selectedGroupDivs.includes(groupDiv)) {
+        selectedGroupDivs.push(groupDiv);
+        groupDiv.querySelector(".dup-group-header").classList.add("group-selected");
+    }
+}
+
+function deselectGroup(groupDiv) {
+    selectedGroupDivs = selectedGroupDivs.filter(g => g !== groupDiv);
+    groupDiv.querySelector(".dup-group-header").classList.remove("group-selected");
+}
+
+function toggleGroupSelection(groupDiv) {
+    if (selectedGroupDivs.includes(groupDiv)) {
+        deselectGroup(groupDiv);
+    } else {
+        selectGroup(groupDiv);
+    }
+}
+
+function clearGroupSelection() {
+    selectedGroupDivs.forEach(g => {
+        const h = g.querySelector(".dup-group-header");
+        if (h) h.classList.remove("group-selected");
+    });
+    selectedGroupDivs = [];
+}
+
+function shiftSelectGroups(groupDiv) {
+    const allGroups = Array.from(document.querySelectorAll(".dup-group"));
+    const lastIdx = selectedGroupDivs.length > 0
+        ? allGroups.indexOf(selectedGroupDivs[selectedGroupDivs.length - 1])
+        : 0;
+    const curIdx = allGroups.indexOf(groupDiv);
+    const [start, end] = lastIdx <= curIdx ? [lastIdx, curIdx] : [curIdx, lastIdx];
+    for (let i = start; i <= end; i++) {
+        selectGroup(allGroups[i]);
+    }
+}
+
+// --- Row selection ---
+function clearRowSelection() {
+    document.querySelectorAll("tr.row-selected").forEach(r => r.classList.remove("row-selected"));
+}
+
+function selectRowRange(fromRow, toRow) {
+    const allRows = Array.from(document.querySelectorAll("tr[data-path]"));
+    const fromIdx = allRows.indexOf(fromRow);
+    const toIdx = allRows.indexOf(toRow);
+    if (fromIdx < 0 || toIdx < 0) return;
+    const [start, end] = fromIdx <= toIdx ? [fromIdx, toIdx] : [toIdx, fromIdx];
+    for (let i = start; i <= end; i++) {
+        allRows[i].classList.add("row-selected");
+    }
+}
+
+// Clear selections when clicking outside
+document.addEventListener("click", (e) => {
+    // Clear group selection if clicking outside groups and not holding Ctrl/Shift
+    if (!e.ctrlKey && !e.metaKey && !e.shiftKey) {
+        if (!e.target.closest(".dup-group-header") && !e.target.closest(".ctx-menu")) {
+            clearGroupSelection();
+        }
+    }
+});
 
 // ── Utilities ──
 function humanSize(n) {

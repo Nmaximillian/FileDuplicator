@@ -1,6 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller spec for macOS (.app bundle)
 
+import re
+_ver = re.search(r'"(.+?)"', open('version.py').read()).group(1)
+
 a = Analysis(
     ['main.py'],
     pathex=[],
@@ -44,7 +47,7 @@ app = BUNDLE(
     icon='FileDuplicator.icns',
     bundle_identifier='com.fileduplicator.app',
     info_plist={
-        'CFBundleShortVersionString': '1.2.0',
+        'CFBundleShortVersionString': _ver,
         'CFBundleName': 'FileDuplicator',
         'CFBundleDisplayName': 'File Duplicator',
         'NSHighResolutionCapable': True,

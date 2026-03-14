@@ -54,6 +54,7 @@ from PyQt6.QtWidgets import (
 )
 
 from scanner import DuplicateGroup, DuplicateMode, FileEntry, ScanStats, scan_directory
+from version import __version__
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -200,7 +201,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("File Duplicator – Duplicate Finder")
+        self.setWindowTitle(f"File Duplicator v{__version__} – Duplicate Finder")
         self.resize(1200, 750)
 
         ico = _icon_path()
@@ -617,8 +618,8 @@ class MainWindow(QMainWindow):
             f"[{mode_label}] Group {idx + 1}  –  "
             f"{len(grp.files)} files  •  {_human_size(grp.files[0].size)} each",
         )
-        # Only expand the first 5 groups (collapsed = far cheaper to render)
-        group_item.setExpanded(idx < 5)
+        # Expand all groups so the user sees every result immediately
+        group_item.setExpanded(True)
         for col in range(5):
             group_item.setBackground(col, color)
             group_item.setForeground(col, GROUP_HEADER_COLOR)
@@ -695,15 +696,24 @@ class MainWindow(QMainWindow):
         if not path:
             return
 
+        # Collect all selected file-level items (items with a parent)
+        selected_file_items = [
+            si for si in self._tree.selectedItems()
+            if si.parent() is not None and si.data(0, Qt.ItemDataRole.UserRole)
+        ]
+        if not selected_file_items:
+            selected_file_items = [item]
+
+        n = len(selected_file_items)
+        suffix = f" ({n} files)" if n > 1 else ""
+
         menu = QMenu(self)
         _fm = "Finder" if sys.platform == "darwin" else "Explorer"
         act_reveal = menu.addAction(f"📂  Show in {_fm} (select file)")
         act_open_dir = menu.addAction("📁  Open containing folder")
         menu.addSeparator()
-        if item.checkState(0) == Qt.CheckState.Checked:
-            act_toggle = menu.addAction("✅  Mark as KEEP")
-        else:
-            act_toggle = menu.addAction("🗑  Mark as DELETE")
+        act_keep = menu.addAction(f"✅  Mark as KEEP{suffix}")
+        act_delete = menu.addAction(f"🗑  Mark as DELETE{suffix}")
 
         chosen = menu.exec(self._tree.viewport().mapToGlobal(pos))
         if chosen == act_reveal:
@@ -712,37 +722,60 @@ class MainWindow(QMainWindow):
         elif chosen == act_open_dir:
             if os.path.exists(path):
                 _open_directory(path)
-        elif chosen == act_toggle:
-            if item.checkState(0) == Qt.CheckState.Checked:
-                item.setCheckState(0, Qt.CheckState.Unchecked)
-            else:
-                item.setCheckState(0, Qt.CheckState.Checked)
+        elif chosen == act_keep:
+            self._tree.blockSignals(True)
+            for si in selected_file_items:
+                si.setCheckState(0, Qt.CheckState.Unchecked)
+                si.setText(0, "KEEP")
+                si.setForeground(0, TEXT_COLOR_KEEP)
+            self._tree.blockSignals(False)
+        elif chosen == act_delete:
+            self._tree.blockSignals(True)
+            for si in selected_file_items:
+                si.setCheckState(0, Qt.CheckState.Checked)
+                si.setText(0, "DELETE")
+                si.setForeground(0, TEXT_COLOR_DEL)
+            self._tree.blockSignals(False)
 
     def _show_group_context_menu(self, group_item: QTreeWidgetItem, pos):
-        """Context menu for a group header – bulk actions for all files in this group."""
-        menu = QMenu(self)
-        act_delete_all = menu.addAction("🗑  Mark ALL in group as DELETE")
-        act_keep_all = menu.addAction("✅  Mark ALL in group as KEEP")
-        menu.addSeparator()
-        act_keep_oldest = menu.addAction("📅  Keep oldest, delete rest")
-        menu.addSeparator()
-        act_expand = menu.addAction("▶  Expand group")
-        act_collapse = menu.addAction("▼  Collapse group")
+        """Context menu for a group header – bulk actions for selected groups."""
+        # Collect all selected top-level (group) items
+        selected_groups = [
+            si for si in self._tree.selectedItems()
+            if si.parent() is None
+        ]
+        if not selected_groups:
+            selected_groups = [group_item]
 
-        gi = self._tree.indexOfTopLevelItem(group_item)
-        color = GROUP_COLORS[gi % len(GROUP_COLORS)]
+        n = len(selected_groups)
+        suffix = f" ({n} groups)" if n > 1 else ""
+
+        menu = QMenu(self)
+        act_delete_all = menu.addAction(f"🗑  Mark ALL as DELETE{suffix}")
+        act_keep_all = menu.addAction(f"✅  Mark ALL as KEEP{suffix}")
+        menu.addSeparator()
+        act_keep_oldest = menu.addAction(f"📅  Keep oldest, delete rest{suffix}")
+        menu.addSeparator()
+        act_expand = menu.addAction(f"▶  Expand{suffix}")
+        act_collapse = menu.addAction(f"▼  Collapse{suffix}")
 
         chosen = menu.exec(self._tree.viewport().mapToGlobal(pos))
-        if chosen == act_delete_all:
-            self._set_group_action(group_item, color, delete_all=True)
-        elif chosen == act_keep_all:
-            self._set_group_action(group_item, color, delete_all=False)
-        elif chosen == act_keep_oldest:
-            self._set_group_keep_oldest(group_item, color)
-        elif chosen == act_expand:
-            group_item.setExpanded(True)
-        elif chosen == act_collapse:
-            group_item.setExpanded(False)
+        if chosen is None:
+            return
+
+        for grp in selected_groups:
+            gi = self._tree.indexOfTopLevelItem(grp)
+            color = GROUP_COLORS[gi % len(GROUP_COLORS)]
+            if chosen == act_delete_all:
+                self._set_group_action(grp, color, delete_all=True)
+            elif chosen == act_keep_all:
+                self._set_group_action(grp, color, delete_all=False)
+            elif chosen == act_keep_oldest:
+                self._set_group_keep_oldest(grp, color)
+            elif chosen == act_expand:
+                grp.setExpanded(True)
+            elif chosen == act_collapse:
+                grp.setExpanded(False)
 
     def _set_group_action(self, group_item: QTreeWidgetItem, color: QColor, *, delete_all: bool):
         """Mark every file in a group as DELETE or KEEP."""

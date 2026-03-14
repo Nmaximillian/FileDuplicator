@@ -11,7 +11,7 @@ A fast duplicate-file scanner and cleaner for large directory trees (8 TB+). Ava
 | Platform | Download | How to install |
 |----------|----------|----------------|
 | **Windows** | `FileDuplicator.exe` | Download and double-click |
-| **macOS** | `FileDuplicator.dmg` | Open DMG → drag to Applications |
+| **macOS** | `FileDuplicator.dmg` | Open DMG → drag to Applications ([see Gatekeeper note](#option-a2--macos-desktop-dmg)) |
 | **Web / NAS** | Docker image | `docker compose up -d` |
 
 ---
@@ -23,6 +23,11 @@ Download `FileDuplicator.exe` from the [latest release](../../releases/latest) a
 
 ### Option A2 – macOS desktop (`.dmg`)
 Download `FileDuplicator.dmg` from the [latest release](../../releases/latest), open it, and drag **FileDuplicator** to your Applications folder.
+
+> **⚠️ macOS Gatekeeper:** Since the app is not signed with an Apple Developer ID, macOS will show a warning on first launch. To open it:
+> 1. **Right-click** (or Ctrl+click) the app → click **Open** → click **Open** again, **or**
+> 2. Go to **System Settings → Privacy & Security** → click **Open Anyway**, **or**
+> 3. Run in Terminal: `xattr -cr /Applications/FileDuplicator.app`
 
 ### Option B – Desktop from source
 ```bash

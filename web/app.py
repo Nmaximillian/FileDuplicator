@@ -13,6 +13,14 @@ import os
 import json
 import time as _time
 import uuid
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from threading import Lock
+
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from version import __version__
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -65,7 +73,7 @@ def _safe_mtime(path: str) -> float:
 # ---------------------------------------------------------------------------
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", version=__version__)
 
 
 # ---------------------------------------------------------------------------
