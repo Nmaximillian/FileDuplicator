@@ -18,7 +18,7 @@ let currentSort = "size_desc";
 let currentSearch = "";
 let scanStartTime = null;    // for elapsed timer
 let elapsedInterval = null;
-const PAGE_SIZE = 50;
+let PAGE_SIZE = 50;
 
 // ── Multi-select state ──
 let lastClickedRow = null;    // for shift+click range selection on file rows
@@ -82,11 +82,22 @@ scanBtn.addEventListener("click", startScan);
 cancelBtn.addEventListener("click", cancelScan);
 $("#autoSelectBtn").addEventListener("click", autoSelectNewer);
 $("#deselectBtn").addEventListener("click", deselectAll);
+$("#expandAllBtn").addEventListener("click", expandAllGroups);
+$("#collapseAllBtn").addEventListener("click", collapseAllGroups);
 $("#deleteBtn").addEventListener("click", showDeleteConfirm);
 $("#confirmDeleteBtn").addEventListener("click", doDelete);
+$("#bulkDeleteBtn").addEventListener("click", showBulkDeleteConfirm);
+$("#confirmBulkDeleteBtn").addEventListener("click", doBulkDelete);
 $("#exportCsvBtn").addEventListener("click", (e) => { e.preventDefault(); exportReport("csv"); });
 $("#exportJsonBtn").addEventListener("click", (e) => { e.preventDefault(); exportReport("json"); });
 loadMoreBtn.addEventListener("click", loadMore);
+$("#pageSizeSpin").addEventListener("change", (e) => {
+    let v = parseInt(e.target.value, 10);
+    if (isNaN(v) || v < 10) v = 10;
+    if (v > 5000) v = 5000;
+    e.target.value = v;
+    PAGE_SIZE = v;
+});
 
 // Multi-directory buttons
 $("#addDirBtn").addEventListener("click", () => {
@@ -745,6 +756,24 @@ function deselectAll() {
     });
 }
 
+function expandAllGroups() {
+    document.querySelectorAll(".dup-group").forEach((grp) => {
+        const body = grp.querySelector(".dup-group-body");
+        const icon = grp.querySelector(".toggle-icon");
+        if (body) body.style.display = "";
+        if (icon) icon.className = "bi bi-chevron-down toggle-icon";
+    });
+}
+
+function collapseAllGroups() {
+    document.querySelectorAll(".dup-group").forEach((grp) => {
+        const body = grp.querySelector(".dup-group-body");
+        const icon = grp.querySelector(".toggle-icon");
+        if (body) body.style.display = "none";
+        if (icon) icon.className = "bi bi-chevron-right toggle-icon";
+    });
+}
+
 // ── Delete ──
 function showDeleteConfirm() {
     const paths = getSelectedPaths();
@@ -1160,4 +1189,125 @@ function buildCompareGroupList(groups) {
     }
     html += `</div>`;
     return html;
+}
+
+// ── Bulk Delete ALL Duplicates ──
+
+function showBulkDeleteConfirm() {
+    if (!currentJobId || !summaryData) return alert("No scan results available.");
+    const msg = `You are about to delete <strong>${summaryData.file_count.toLocaleString()}</strong> duplicate files ` +
+        `across <strong>${summaryData.group_count.toLocaleString()}</strong> groups.<br><br>` +
+        `This will free approximately <strong>${summaryData.reclaimable_h}</strong> of disk space.<br><br>` +
+        `The <strong>oldest</strong> file in each group will be kept.`;
+    $("#bulkDeleteMsg").innerHTML = msg;
+    new bootstrap.Modal($("#bulkDeleteModal")).show();
+}
+
+function doBulkDelete() {
+    bootstrap.Modal.getInstance($("#bulkDeleteModal")).hide();
+
+    // Show progress modal
+    const progressModal = new bootstrap.Modal($("#bulkDeleteProgressModal"));
+    progressModal.show();
+
+    const bar = $("#bulkDeleteProgressBar");
+    const countEl = $("#bulkDeleteCount");
+    const deletedEl = $("#bulkDeleteDeleted");
+    const freedEl = $("#bulkDeleteFreed");
+    const errorsEl = $("#bulkDeleteErrors");
+
+    // Reset
+    bar.style.width = "0%";
+    bar.textContent = "0%";
+    bar.className = "progress-bar progress-bar-striped progress-bar-animated bg-danger";
+    countEl.textContent = "0 / 0";
+    deletedEl.textContent = "0";
+    freedEl.textContent = "0 B";
+    errorsEl.textContent = "0";
+
+    fetchSSEBulkDelete(currentJobId, bar, countEl, deletedEl, freedEl, errorsEl, progressModal);
+}
+
+async function fetchSSEBulkDelete(jobId, bar, countEl, deletedEl, freedEl, errorsEl, progressModal) {
+    try {
+        const resp = await fetch(`/api/scan/${jobId}/delete-all-duplicates`, { method: "POST" });
+        if (!resp.ok) {
+            const err = await resp.json();
+            progressModal.hide();
+            alert("Error: " + (err.error || "Unknown error"));
+            return;
+        }
+
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let lastData = null;
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop();  // keep incomplete line
+
+            for (const line of lines) {
+                if (line.startsWith("data: ")) {
+                    const data = JSON.parse(line.slice(6));
+                    lastData = data;
+
+                    const pct = data.total > 0 ? Math.round((data.current / data.total) * 100) : 0;
+                    bar.style.width = pct + "%";
+                    bar.textContent = pct + "%";
+                    countEl.textContent = `${data.current.toLocaleString()} / ${data.total.toLocaleString()}`;
+                    deletedEl.textContent = data.deleted.toLocaleString();
+                    freedEl.textContent = data.freed_h;
+                    errorsEl.textContent = data.error_count.toLocaleString();
+
+                    if (data.status === "done") {
+                        bar.classList.remove("progress-bar-animated");
+                        bar.classList.replace("bg-danger", "bg-success");
+                        bar.textContent = "Complete!";
+
+                        // Wait a moment then show result
+                        setTimeout(() => {
+                            progressModal.hide();
+                            showBulkDeleteResult(data);
+                        }, 1000);
+                    }
+                }
+            }
+        }
+    } catch (e) {
+        progressModal.hide();
+        alert("Bulk delete failed: " + e.message);
+    }
+}
+
+function showBulkDeleteResult(data) {
+    let html = `<div class="mb-3">`;
+    html += `<div class="d-flex gap-3 mb-3 justify-content-center">`;
+    html += `<div class="text-center"><div class="fs-3 text-success fw-bold">${data.deleted.toLocaleString()}</div><div class="text-muted small">Files Deleted</div></div>`;
+    html += `<div class="text-center"><div class="fs-3 text-info fw-bold">${data.freed_h}</div><div class="text-muted small">Space Freed</div></div>`;
+    html += `<div class="text-center"><div class="fs-3 fw-bold">${data.kept.toLocaleString()}</div><div class="text-muted small">Files Kept</div></div>`;
+    if (data.error_count > 0) {
+        html += `<div class="text-center"><div class="fs-3 text-warning fw-bold">${data.error_count.toLocaleString()}</div><div class="text-muted small">Errors</div></div>`;
+    }
+    html += `</div>`;
+
+    if (data.error_count > 0) {
+        html += `<div class="alert alert-warning py-2 small"><strong>Errors (first ${data.errors.length}):</strong><ul class="mb-0 mt-1">`;
+        for (const err of data.errors) {
+            html += `<li>${escHtml(err.path)}: ${escHtml(err.error)}</li>`;
+        }
+        html += `</ul></div>`;
+    }
+
+    if (data.error_count === 0) {
+        html += `<div class="alert alert-success py-2"><i class="bi bi-check-circle-fill"></i> All duplicate files were successfully deleted!</div>`;
+    }
+    html += `</div>`;
+
+    $("#deletionResultBody").innerHTML = html;
+    new bootstrap.Modal($("#deletionResultModal")).show();
 }

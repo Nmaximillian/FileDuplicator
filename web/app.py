@@ -295,7 +295,7 @@ def api_scan_groups(job_id: str):
     sort_by = request.args.get("sort", "size_desc")
     offset = request.args.get("offset", 0, type=int)
     limit = request.args.get("limit", PAGE_SIZE, type=int)
-    limit = min(limit, 200)  # cap max per request
+    limit = min(limit, 5000)  # cap max per request
 
     groups = job["groups"]
 
@@ -430,6 +430,86 @@ def api_delete():
             errors.append({"path": p, "error": str(exc)})
 
     return jsonify({"deleted": len(deleted), "errors": errors})
+
+
+@app.route("/api/scan/<job_id>/delete-all-duplicates", methods=["POST"])
+def api_delete_all_duplicates(job_id: str):
+    """Delete ALL duplicate files across every group (server-side).
+
+    Keeps the oldest file in each group and deletes the rest.
+    Streams SSE progress so the UI can show a progress bar for 100K+ files.
+    """
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "unknown job"}), 404
+    if job["status"] != "done":
+        return jsonify({"error": "scan not complete"}), 400
+
+    groups = job["groups"]
+
+    # Gather ALL files to delete (everything except the oldest in each group)
+    to_delete = []
+    to_keep = []
+    for g in groups:
+        for f in g["files"]:
+            if f["is_oldest"]:
+                to_keep.append(f)
+            else:
+                to_delete.append(f)
+
+    total = len(to_delete)
+    if total == 0:
+        return jsonify({"error": "No files to delete"}), 400
+
+    def generate():
+        deleted_count = 0
+        freed_bytes = 0
+        errors = []
+
+        for i, f in enumerate(to_delete):
+            path = f["path"]
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+                    deleted_count += 1
+                    freed_bytes += f["size"]
+                else:
+                    errors.append({"path": path, "error": "File not found"})
+            except Exception as exc:
+                errors.append({"path": path, "error": str(exc)})
+
+            # Send progress every 100 files or on the last one
+            if (i + 1) % 100 == 0 or i == total - 1:
+                payload = {
+                    "status": "progress",
+                    "current": i + 1,
+                    "total": total,
+                    "deleted": deleted_count,
+                    "freed": freed_bytes,
+                    "freed_h": _human_size(freed_bytes),
+                    "error_count": len(errors),
+                }
+                yield f"data: {json.dumps(payload)}\n\n"
+
+        # Final summary
+        payload = {
+            "status": "done",
+            "deleted": deleted_count,
+            "total": total,
+            "freed": freed_bytes,
+            "freed_h": _human_size(freed_bytes),
+            "kept": len(to_keep),
+            "errors": errors[:50],  # cap at 50 to avoid huge payload
+            "error_count": len(errors),
+        }
+        yield f"data: {json.dumps(payload)}\n\n"
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.route("/api/scan/<job_id>/export/csv")

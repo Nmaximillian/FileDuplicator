@@ -127,6 +127,13 @@
             <button id="deselectBtn" class="btn btn-sm btn-outline-secondary">
                 <i class="bi bi-x-circle"></i> Deselect All
             </button>
+            <span class="border-start border-secondary ms-2 me-2"></span>
+            <button id="expandAllBtn" class="btn btn-sm btn-outline-light" title="Expand all visible groups">
+                <i class="bi bi-arrows-expand"></i> Expand All
+            </button>
+            <button id="collapseAllBtn" class="btn btn-sm btn-outline-light" title="Collapse all visible groups">
+                <i class="bi bi-arrows-collapse"></i> Collapse All
+            </button>
             <span class="text-muted small ms-2">
                 <i class="bi bi-mouse"></i> Right-click group headers for bulk actions
             </span>
@@ -150,6 +157,9 @@
                 </div>
                 <button id="deleteBtn" class="btn btn-sm btn-danger fw-bold">
                     <i class="bi bi-trash3"></i> Delete Selected
+                </button>
+                <button id="bulkDeleteBtn" class="btn btn-sm btn-danger fw-bold" title="Delete ALL duplicate files across every group (keeps oldest)">
+                    <i class="bi bi-trash3-fill"></i> Delete ALL Duplicates
                 </button>
             </div>
         </div>
@@ -181,11 +191,15 @@
         <div id="groupsContainer"></div>
 
         <!-- Load more -->
-        <div id="loadMoreArea" class="text-center py-3 d-none">
-            <button id="loadMoreBtn" class="btn btn-outline-primary mb-2">
-                <i class="bi bi-arrow-down-circle"></i> Load More
+        <div id="loadMoreArea" class="d-flex align-items-center gap-3 py-3 d-none flex-wrap">
+            <div class="d-flex align-items-center gap-2">
+                <label for="pageSizeSpin" class="form-label mb-0 small text-muted">Groups per page:</label>
+                <input id="pageSizeSpin" type="number" class="form-control form-control-sm" style="width:90px" min="10" max="5000" step="50" value="50">
+            </div>
+            <button id="loadMoreBtn" class="btn btn-outline-primary">
+                <i class="bi bi-arrow-down-circle"></i> Load More Groups
             </button>
-            <div id="loadMoreInfo" class="text-muted small"></div>
+            <span id="loadMoreInfo" class="text-muted small"></span>
         </div>
     </div>
 </div>
@@ -292,6 +306,64 @@
                     </button>
                 </div>
                 <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal">OK</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Bulk delete confirmation modal -->
+<div class="modal fade" id="bulkDeleteModal" tabindex="-1" data-bs-backdrop="static" data-bs-keyboard="false">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark">
+            <div class="modal-header py-2 text-danger">
+                <h6 class="modal-title"><i class="bi bi-exclamation-triangle-fill"></i> Delete ALL Duplicates</h6>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <p id="bulkDeleteMsg" class="mb-2"></p>
+                <p class="text-danger fw-bold mb-0"><i class="bi bi-exclamation-octagon-fill"></i> This will permanently delete files. This action CANNOT be undone.</p>
+            </div>
+            <div class="modal-footer py-2">
+                <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button id="confirmBulkDeleteBtn" class="btn btn-sm btn-danger fw-bold">
+                    <i class="bi bi-trash3-fill"></i> Yes, Delete ALL Duplicates
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Bulk delete progress modal -->
+<div class="modal fade" id="bulkDeleteProgressModal" tabindex="-1" data-bs-backdrop="static" data-bs-keyboard="false">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark">
+            <div class="modal-header py-2">
+                <h6 class="modal-title"><i class="bi bi-hourglass-split text-warning"></i> Deleting Duplicates…</h6>
+            </div>
+            <div class="modal-body">
+                <div class="mb-3">
+                    <div class="progress" style="height: 24px">
+                        <div id="bulkDeleteProgressBar" class="progress-bar progress-bar-striped progress-bar-animated bg-danger" style="width:0%">0%</div>
+                    </div>
+                </div>
+                <div class="row text-center small">
+                    <div class="col">
+                        <div class="text-muted">Progress</div>
+                        <div id="bulkDeleteCount" class="fw-bold fs-6">0 / 0</div>
+                    </div>
+                    <div class="col">
+                        <div class="text-muted">Deleted</div>
+                        <div id="bulkDeleteDeleted" class="fw-bold fs-6 text-success">0</div>
+                    </div>
+                    <div class="col">
+                        <div class="text-muted">Freed</div>
+                        <div id="bulkDeleteFreed" class="fw-bold fs-6 text-info">0 B</div>
+                    </div>
+                    <div class="col">
+                        <div class="text-muted">Errors</div>
+                        <div id="bulkDeleteErrors" class="fw-bold fs-6 text-warning">0</div>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
