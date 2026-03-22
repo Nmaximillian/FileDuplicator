@@ -14,6 +14,12 @@ A fast duplicate-file scanner and cleaner for large directory trees (8 TB+). Ava
 | **macOS** | `FileDuplicator.dmg` | Open DMG → drag to Applications ([see Gatekeeper note](#option-a2--macos-desktop-dmg)) |
 | **Web / NAS** | Docker image | `docker compose up -d` |
 
+### Screenshots
+
+![Desktop – Directory Rules](screenshots/v1.3.0-desktop-rules.png)
+
+![Web UI – Rules & scan results](screenshots/v1.3.0-web-rules.png)
+
 ---
 
 ## Running the App
@@ -148,16 +154,6 @@ pyinstaller FileDuplicator_macOS.spec
 - **Confirmation dialog** – shows file count and reclaimable space before deletion
 - **Per-file error reporting** after deletion
 - **Elapsed time & timestamp** – see how long the scan took and when it finished
-
----
-
-## Screenshots
-
-### Desktop – Directory Rules panel
-![Desktop directory rules](screenshots/v1.3.0-desktop-rules.png)
-
-### Web UI – Rules & scan results
-![Web directory rules](screenshots/v1.3.0-web-rules.png)
 
 ---
 

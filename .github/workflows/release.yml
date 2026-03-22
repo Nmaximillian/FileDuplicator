@@ -125,12 +125,25 @@ jobs:
         id: tag
         run: echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
 
+      - name: Check for release notes file
+        id: notes
+        run: |
+          FILE="release-notes/${{ steps.tag.outputs.TAG }}.md"
+          if [ -f "$FILE" ]; then
+            echo "file=$FILE" >> $GITHUB_OUTPUT
+            echo "found=true" >> $GITHUB_OUTPUT
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.TAG }}
           name: "${{ steps.tag.outputs.TAG }}"
-          generate_release_notes: true
+          body_path: ${{ steps.notes.outputs.found == 'true' && steps.notes.outputs.file || '' }}
+          generate_release_notes: ${{ steps.notes.outputs.found != 'true' }}
+          make_latest: true
           files: |
             release-assets/FileDuplicator.exe
             release-assets/FileDuplicator.dmg
