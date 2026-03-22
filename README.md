@@ -140,12 +140,24 @@ pyinstaller FileDuplicator_macOS.spec
 - **Runs headless** – no display server needed (perfect for NAS)
 
 ### Both editions
-- **Color-coded duplicate groups** – KEEP in green, DELETE in red
+- **Directory Rules** – mark folders as *Preserve* (always keep) or *Expendable* (safe to delete if copies exist elsewhere); conflicts flagged as REVIEW
+- **Spacebar toggle** – press Space on any selected file to flip between KEEP and DELETE
+- **Color-coded duplicate groups** – KEEP in green, DELETE in red, REVIEW in orange
 - **Automatic suggestions** – oldest file kept, newer copies marked for deletion
 - **Bulk actions** – "Select All Newer as Delete" / "Deselect All"
 - **Confirmation dialog** – shows file count and reclaimable space before deletion
 - **Per-file error reporting** after deletion
 - **Elapsed time & timestamp** – see how long the scan took and when it finished
+
+---
+
+## Screenshots
+
+### Desktop – Directory Rules panel
+![Desktop directory rules](screenshots/v1.3.0-desktop-rules.png)
+
+### Web UI – Rules & scan results
+![Web directory rules](screenshots/v1.3.0-web-rules.png)
 
 ---
 
@@ -179,6 +191,9 @@ FileDuplicator/
 ├── FileDuplicator_macOS.spec # PyInstaller build config (macOS .app)
 ├── generate_icon.py         # Regenerate the .ico via Pillow
 ├── generate_icns.py         # Regenerate the .icns via Pillow + iconutil (macOS)
+├── release-notes/
+│   └── v1.3.0.md             # Per-version release notes
+├── screenshots/              # App screenshots for docs
 ├── .github/workflows/
 │   └── release.yml          # Auto-build Windows + macOS on tag push
 ├── web/

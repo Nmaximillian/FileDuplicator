@@ -27,7 +27,7 @@ from pathlib import Path
 
 from flask import Flask, render_template, request, jsonify, Response, stream_with_context
 
-from scanner import DuplicateGroup, DuplicateMode, FileEntry, ScanStats, scan_directory
+from scanner import DuplicateGroup, DuplicateMode, FileEntry, ScanStats, scan_directory, DirectoryRule, apply_directory_rules
 
 # ---------------------------------------------------------------------------
 # App
@@ -165,6 +165,20 @@ def api_scan_start():
     min_size = min_size_map.get(data.get("min_size", "1KB"), 1024)
     use_sha256 = data.get("use_sha256", False)
 
+    # Optional file index – write a CSV of ALL scanned files to the first root dir
+    save_index = data.get("save_index", False)
+    index_path: str | None = None
+    if save_index and roots:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        index_path = os.path.join(roots[0], f"file_index_{ts}.csv")
+
+    # Directory rules
+    raw_rules = data.get("rules", [])
+    dir_rules: list[DirectoryRule] = []
+    for r in raw_rules:
+        if isinstance(r, dict) and r.get("path") and r.get("type") in ("preserve", "expendable"):
+            dir_rules.append(DirectoryRule(path=r["path"], rule_type=r["type"]))
+
     def _run():
         try:
             def _progress(phase, cur, tot):
@@ -180,6 +194,7 @@ def api_scan_start():
                 recursive=recursive,
                 min_size=min_size,
                 use_sha256=use_sha256,
+                index_path=index_path,
                 progress=_progress,
                 cancelled=lambda: job["cancelled"],
             )
@@ -190,8 +205,13 @@ def api_scan_start():
             job["current"] = 0
             job["total"] = 0
 
+            # Apply directory rules if any
+            rule_decisions = {}
+            if dir_rules:
+                rule_decisions = apply_directory_rules(groups, dir_rules)
+
             # Serialise and sort by file size descending (biggest dupes first)
-            serialised = _serialise_groups(groups)
+            serialised = _serialise_groups(groups, rule_decisions=rule_decisions)
             serialised.sort(
                 key=lambda g: g["files"][0]["size"] if g["files"] else 0,
                 reverse=True,
@@ -225,6 +245,9 @@ def api_scan_start():
             job["summary"]["finished_at"] = job["finished_at"]
             job["summary"]["elapsed"] = elapsed
             job["summary"]["elapsed_h"] = _human_elapsed(elapsed)
+            job["summary"]["index_path"] = stats.index_path or ""
+            job["index_path"] = stats.index_path or ""
+            job["summary"]["rules_applied"] = len(rule_decisions)
             job["status"] = "done"
         except Exception as exc:
             job["error"] = str(exc)
@@ -453,7 +476,12 @@ def api_delete_all_duplicates(job_id: str):
     to_keep = []
     for g in groups:
         for f in g["files"]:
-            if f["is_oldest"]:
+            ra = f.get("rule_action", "")
+            if ra == "delete":
+                to_delete.append(f)
+            elif ra in ("keep", "review"):
+                to_keep.append(f)
+            elif f["is_oldest"]:
                 to_keep.append(f)
             else:
                 to_delete.append(f)
@@ -586,10 +614,43 @@ def api_export_json(job_id: str):
     )
 
 
+@app.route("/api/scan/<job_id>/export/index")
+def api_export_index(job_id: str):
+    """Download the file index CSV that was saved to disk during the scan.
+
+    Only available when the scan was started with save_index=true.
+    The file lives on the NAS filesystem; this endpoint streams it to the browser.
+    """
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "unknown job"}), 404
+    if job["status"] != "done":
+        return jsonify({"error": "scan not complete"}), 400
+
+    saved_path = job.get("index_path", "")
+    if not saved_path or not os.path.isfile(saved_path):
+        return jsonify({
+            "error": "No file index available. Enable '💾 Save file index' before starting the scan."
+        }), 404
+
+    def _stream():
+        with open(saved_path, "rb") as f:
+            while chunk := f.read(1024 * 1024):
+                yield chunk
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return Response(
+        stream_with_context(_stream()),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="file_index_{ts}.csv"'},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def _serialise_groups(groups: list[DuplicateGroup]) -> list[dict]:
+def _serialise_groups(groups: list[DuplicateGroup], *, rule_decisions: dict[str, str] | None = None) -> list[dict]:
     result = []
     for idx, grp in enumerate(groups):
         sorted_files = sorted(grp.files, key=lambda f: _safe_mtime(f.path))
@@ -605,6 +666,7 @@ def _serialise_groups(groups: list[DuplicateGroup]) -> list[dict]:
                          else ""),
                 "mtime": _safe_mtime(fe.path),
                 "is_oldest": fi == 0,
+                "rule_action": (rule_decisions or {}).get(fe.path, ""),
             })
         result.append({
             "index": idx + 1,

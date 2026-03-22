@@ -113,6 +113,76 @@ $("#clearDirsBtn").addEventListener("click", () => {
 });
 renderDirList();  // initial render
 
+// ── Directory Rules state ──
+const dirRules = [];
+
+function renderRules() {
+    const el = $("#rulesList");
+    if (!el) return;
+    el.innerHTML = "";
+    if (dirRules.length === 0) {
+        el.innerHTML = '<div class="list-group-item bg-dark text-muted py-1" style="font-size:.85rem">(no rules \u2013 all files treated equally)</div>';
+        return;
+    }
+    dirRules.forEach((r, i) => {
+        const icon = r.type === "preserve"
+            ? '<i class="bi bi-shield-check text-success me-2"></i>'
+            : '<i class="bi bi-trash text-danger me-2"></i>';
+        const label = r.type === "preserve" ? "PRESERVE" : "EXPENDABLE";
+        const badgeClass = r.type === "preserve" ? "bg-success" : "bg-danger";
+        const item = document.createElement("div");
+        item.className = "list-group-item bg-dark text-light d-flex align-items-center py-1";
+        item.style.fontSize = ".85rem";
+        item.innerHTML = `${icon}
+            <span class="badge ${badgeClass} me-2" style="font-size:.65rem">${label}</span>
+            <span class="flex-grow-1 text-truncate">${escHtml(r.path)}</span>
+            <button class="btn btn-sm btn-outline-danger ms-2 py-0 px-1" title="Remove">
+                <i class="bi bi-x-lg"></i>
+            </button>`;
+        item.querySelector("button").addEventListener("click", () => {
+            dirRules.splice(i, 1);
+            renderRules();
+        });
+        el.appendChild(item);
+    });
+}
+
+function addRule(path, type) {
+    const p = path.trim();
+    if (!p) return;
+    if (dirRules.some(r => r.path === p && r.type === type)) return;
+    dirRules.push({ path: p, type: type });
+    renderRules();
+}
+
+function addRuleFromInput(type) {
+    const input = $("#ruleInput");
+    const path = input.value.trim();
+    if (path) {
+        addRule(path, type);
+        input.value = "";
+    } else {
+        browseTarget = type;  // "preserve" or "expendable"
+        browseTo("/");
+        browseModal.show();
+    }
+}
+
+$("#addPreserveBtn").addEventListener("click", () => addRuleFromInput("preserve"));
+$("#addExpendableBtn").addEventListener("click", () => addRuleFromInput("expendable"));
+$("#clearRulesBtn").addEventListener("click", () => {
+    dirRules.length = 0;
+    renderRules();
+});
+$("#browseRuleBtn").addEventListener("click", () => {
+    browseTarget = "ruleInput";
+    const initial = $("#ruleInput").value.trim() || "/";
+    browseTo(initial);
+    browseModal.show();
+});
+
+renderRules();  // initial render
+
 // Sort & search
 const sortSelect = $("#sortSelect");
 const searchInput = $("#searchInput");
@@ -181,6 +251,8 @@ async function startScan() {
         recursive: $("#chkRecursive").checked,
         min_size: $("#minSize").value,
         use_sha256: $("#hashAlgo").value === "sha256",
+        save_index: $("#chkSaveIndex").checked,
+        rules: dirRules.map(r => ({ path: r.path, type: r.type })),
     };
 
     try {
@@ -354,6 +426,9 @@ function showSummary(s) {
     if (s.cloud_skipped > 0) {
         statsHtml += ` &nbsp;•&nbsp; ${s.cloud_skipped.toLocaleString()} cloud files skipped`;
     }
+    if (s.rules_applied > 0) {
+        statsHtml += ` &nbsp;•&nbsp; <i class="bi bi-shield-check"></i> ${s.rules_applied.toLocaleString()} files auto-marked by rules`;
+    }
     if (s.elapsed_h) {
         statsHtml += ` &nbsp;•&nbsp; <i class="bi bi-stopwatch"></i> ${s.elapsed_h}`;
     }
@@ -370,6 +445,15 @@ function showSummary(s) {
         <strong>${s.file_count.toLocaleString()}</strong>&nbsp;duplicate files &nbsp;•&nbsp;
         <strong>${s.reclaimable_h}</strong>&nbsp;reclaimable
     `;
+
+    // Show / hide the File Index download button
+    const indexBtn = $("#downloadIndexBtn");
+    if (s.index_path) {
+        indexBtn.href = `/api/scan/${currentJobId}/export/index`;
+        indexBtn.classList.remove("d-none");
+    } else {
+        indexBtn.classList.add("d-none");
+    }
 }
 
 // ── Paginated group loading ──
@@ -489,12 +573,24 @@ function buildGroup(group, expanded) {
 
     for (let i = 0; i < group.files.length; i++) {
         const f = group.files[i];
-        const checked = f.is_oldest ? "" : "checked";
-        const actionClass = f.is_oldest ? "action-keep" : "action-delete";
-        const actionText = f.is_oldest ? "KEEP" : "DELETE";
+        let checked, actionClass, actionText, ruleBadge = "";
+        if (f.rule_action === "keep") {
+            checked = ""; actionClass = "action-keep"; actionText = "KEEP";
+            ruleBadge = ' <span class="badge bg-success rule-badge" title="Preserve rule applied">R</span>';
+        } else if (f.rule_action === "delete") {
+            checked = "checked"; actionClass = "action-delete"; actionText = "DELETE";
+            ruleBadge = ' <span class="badge bg-danger rule-badge" title="Expendable rule applied">R</span>';
+        } else if (f.rule_action === "review") {
+            checked = ""; actionClass = "action-review"; actionText = "\u26a0 REVIEW";
+            ruleBadge = ' <span class="badge bg-warning rule-badge" title="Conflicting rules \u2013 review manually">\u26a0</span>';
+        } else {
+            checked = f.is_oldest ? "" : "checked";
+            actionClass = f.is_oldest ? "action-keep" : "action-delete";
+            actionText = f.is_oldest ? "KEEP" : "DELETE";
+        }
         html += `<tr data-path="${escHtml(f.path)}" data-group="${group.index}">
             <td><input type="checkbox" class="dup-check" data-path="${escHtml(f.path)}" data-size="${f.size}" ${checked}></td>
-            <td class="action-label ${actionClass}">${actionText}</td>
+            <td class="action-label ${actionClass}">${actionText}${ruleBadge}</td>
             <td>${escHtml(f.name)}</td>
             <td class="path-cell" title="${escHtml(f.path)}">${escHtml(f.path)}</td>
             <td style="white-space:nowrap">${f.size_h}</td>
@@ -920,8 +1016,10 @@ function exportReport(format) {
 // ── Browse modal ──
 const browseModal = new bootstrap.Modal($("#browseModal"));
 let browseCurrent = "/";
+let browseTarget = "dir";  // "dir" | "preserve" | "expendable" | "ruleInput"
 
 $("#browseBtn").addEventListener("click", () => {
+    browseTarget = "dir";
     const initial = dirInput.value.trim() || "/";
     browseTo(initial);
     browseModal.show();
@@ -936,7 +1034,13 @@ $("#browsePathInput").addEventListener("keydown", (e) => {
 });
 
 $("#browseSelectBtn").addEventListener("click", () => {
-    addDirectory(browseCurrent);
+    if (browseTarget === "preserve" || browseTarget === "expendable") {
+        addRule(browseCurrent, browseTarget);
+    } else if (browseTarget === "ruleInput") {
+        $("#ruleInput").value = browseCurrent;
+    } else {
+        addDirectory(browseCurrent);
+    }
     dirInput.value = "";
     browseModal.hide();
 });
@@ -1050,6 +1154,31 @@ document.addEventListener("click", (e) => {
             clearGroupSelection();
         }
     }
+});
+
+// ── Spacebar toggles KEEP / DELETE on selected (or focused) rows ──
+document.addEventListener("keydown", (e) => {
+    // Ignore if user is typing in an input/textarea/select
+    const tag = document.activeElement?.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+    if (e.key !== " ") return;
+    e.preventDefault();  // prevent page scroll
+
+    // Gather rows: selected rows first, fallback to hovered row
+    let rows = Array.from(document.querySelectorAll("tr.row-selected[data-path]"));
+    if (rows.length === 0) {
+        // Check if there's a hovered row
+        const hovered = document.querySelector("tr[data-path]:hover");
+        if (hovered) rows = [hovered];
+    }
+    if (rows.length === 0) return;
+
+    rows.forEach((tr) => {
+        const cb = tr.querySelector(".dup-check");
+        if (!cb) return;
+        cb.checked = !cb.checked;
+        cb.dispatchEvent(new Event("change"));
+    });
 });
 
 // ── Utilities ──

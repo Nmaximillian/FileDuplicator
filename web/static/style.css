@@ -106,6 +106,17 @@ body {
     font-weight: 700;
 }
 
+.action-review {
+    color: #ffcc80;
+    font-weight: 700;
+}
+
+.rule-badge {
+    font-size: 0.6rem;
+    vertical-align: super;
+    padding: 1px 3px;
+}
+
 /* Checkbox styling */
 .dup-table input[type="checkbox"] {
     width: 1.1em;

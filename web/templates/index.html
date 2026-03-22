@@ -88,6 +88,44 @@
                         <option value="sha256">SHA-256 (paranoid)</option>
                     </select>
                 </div>
+                <div class="col-auto ms-3 form-check">
+                    <input id="chkSaveIndex" class="form-check-input" type="checkbox">
+                    <label class="form-check-label" for="chkSaveIndex"
+                           title="Save a CSV index of ALL scanned files (not just duplicates) to the first scan directory. Open it in any spreadsheet or text editor to find files on your disk later without re-scanning.">
+                        💾 Save file index
+                    </label>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Directory Rules (optional) -->
+    <div class="card mb-3">
+        <div class="card-body py-2">
+            <div class="d-flex align-items-center mb-1">
+                <span class="fw-bold">Directory Rules</span>
+                <small class="text-muted ms-2">(optional – auto-mark files based on location)</small>
+            </div>
+            <div id="rulesList" class="list-group list-group-flush mb-2" style="max-height:120px;overflow-y:auto">
+                <div class="list-group-item bg-dark text-muted py-1" style="font-size:.85rem">(no rules – all files treated equally)</div>
+            </div>
+            <div class="d-flex gap-2 flex-wrap align-items-center">
+                <div class="input-group" style="max-width:350px">
+                    <input id="ruleInput" type="text" class="form-control form-control-sm" placeholder="/path/to/directory">
+                    <button id="browseRuleBtn" class="btn btn-outline-secondary btn-sm" type="button" title="Browse for directory">
+                        <i class="bi bi-folder2-open"></i>
+                    </button>
+                </div>
+                <button id="addPreserveBtn" class="btn btn-sm btn-outline-success" type="button" title="Always keep files here, delete matches elsewhere">
+                    <i class="bi bi-shield-check"></i> + Preserve
+                </button>
+                <button id="addExpendableBtn" class="btn btn-sm btn-outline-danger" type="button" title="Delete files here if copies exist elsewhere">
+                    <i class="bi bi-trash"></i> + Expendable
+                </button>
+                <button id="clearRulesBtn" class="btn btn-sm btn-outline-secondary" type="button">Clear</button>
+                <small class="text-muted ms-auto" style="font-size:.7rem">
+                    <b>Preserve</b> = always keep &nbsp;•&nbsp; <b>Expendable</b> = delete if copies exist elsewhere
+                </small>
             </div>
         </div>
     </div>
@@ -141,6 +179,10 @@
                 <button id="compareBtn" class="btn btn-sm btn-outline-warning" title="Compare two completed scans">
                     <i class="bi bi-arrow-left-right"></i> Compare Scans
                 </button>
+                <a id="downloadIndexBtn" href="#" class="btn btn-sm btn-outline-secondary d-none"
+                   title="Download the file index CSV (all scanned files, not just duplicates)">
+                    <i class="bi bi-card-list"></i> File Index
+                </a>
                 <div class="dropdown">
                     <button id="exportBtn" class="btn btn-sm btn-outline-info dropdown-toggle" type="button"
                             data-bs-toggle="dropdown" aria-expanded="false">

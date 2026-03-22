@@ -53,7 +53,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from scanner import DuplicateGroup, DuplicateMode, FileEntry, ScanStats, scan_directory
+from scanner import DuplicateGroup, DuplicateMode, FileEntry, ScanStats, scan_directory, DirectoryRule, apply_directory_rules
 from version import __version__
 
 # ---------------------------------------------------------------------------
@@ -135,6 +135,7 @@ class ScanWorker(QThread):
         recursive: bool,
         min_size: int,
         use_sha256: bool = False,
+        index_path: str | None = None,
     ):
         super().__init__()
         self.roots = roots
@@ -144,6 +145,7 @@ class ScanWorker(QThread):
         self.recursive = recursive
         self.min_size = min_size
         self.use_sha256 = use_sha256
+        self.index_path = index_path
         self._cancelled = False
 
     def cancel(self):
@@ -159,6 +161,7 @@ class ScanWorker(QThread):
                 recursive=self.recursive,
                 min_size=self.min_size,
                 use_sha256=self.use_sha256,
+                index_path=self.index_path,
                 progress=lambda phase, cur, tot: self.progress.emit(phase, cur, tot),
                 cancelled=lambda: self._cancelled,
             )
@@ -186,6 +189,7 @@ GROUP_COLORS = [
 TEXT_COLOR_LIGHT = QColor("#e0e0e0")
 TEXT_COLOR_KEEP  = QColor("#81c784")
 TEXT_COLOR_DEL   = QColor("#ef9a9a")
+TEXT_COLOR_REVIEW = QColor("#ffcc80")
 GROUP_HEADER_COLOR = QColor("#ffffff")
 
 
@@ -216,6 +220,7 @@ class MainWindow(QMainWindow):
         self._scan_start_time: float = 0.0          # monotonic start time
         self._scan_elapsed: float = 0.0             # elapsed seconds
         self._scan_finished_at: str = ""            # ISO timestamp
+        self._rule_decisions: dict[str, str] = {}    # filepath → keep/delete/review
 
         self._build_ui()
         self._restore_state()
@@ -278,7 +283,55 @@ class MainWindow(QMainWindow):
             "SHA-256 is cryptographic – slower but gives absolute certainty."
         )
         opts_layout.addWidget(self._hash_combo)
+        opts_layout.addWidget(QLabel("  "))
+        self._chk_save_index = QCheckBox("💾 Save file index")
+        self._chk_save_index.setToolTip(
+            "After scanning, write a CSV index of ALL files found (not just duplicates)\n"
+            "to the first scan directory as file_index_YYYYMMDD_HHMMSS.csv.\n"
+            "Useful for searching your disk later without re-scanning – like IYF or Everything."
+        )
+        opts_layout.addWidget(self._chk_save_index)
         root_layout.addWidget(opts_group)
+
+        # --- Directory Rules (optional) ---
+        rules_group = QGroupBox("Directory Rules (optional)")
+        rules_layout = QVBoxLayout(rules_group)
+        rules_help = QLabel(
+            "<small>Mark directories as <b>Preserve</b> (always keep files here, "
+            "delete matches elsewhere) or <b>Expendable</b> (delete files here "
+            "if a copy exists elsewhere).</small>"
+        )
+        rules_help.setWordWrap(True)
+        rules_layout.addWidget(rules_help)
+        self._rules_list = QListWidget()
+        self._rules_list.setMaximumHeight(80)
+        self._rules_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self._rules_list.setAlternatingRowColors(True)
+        rules_layout.addWidget(self._rules_list)
+        rules_btn_row = QHBoxLayout()
+        self._add_preserve_btn = QPushButton("+ Preserve")
+        self._add_preserve_btn.setToolTip(
+            "Files here are canonical \u2014 delete matching copies found elsewhere"
+        )
+        self._add_preserve_btn.setStyleSheet("color: #81c784;")
+        self._add_preserve_btn.clicked.connect(lambda: self._add_rule("preserve"))
+        rules_btn_row.addWidget(self._add_preserve_btn)
+        self._add_expendable_btn = QPushButton("+ Expendable")
+        self._add_expendable_btn.setToolTip(
+            "Files here are junk copies \u2014 delete them if a copy exists anywhere else"
+        )
+        self._add_expendable_btn.setStyleSheet("color: #ef9a9a;")
+        self._add_expendable_btn.clicked.connect(lambda: self._add_rule("expendable"))
+        rules_btn_row.addWidget(self._add_expendable_btn)
+        self._remove_rule_btn = QPushButton("Remove")
+        self._remove_rule_btn.clicked.connect(self._remove_selected_rules)
+        rules_btn_row.addWidget(self._remove_rule_btn)
+        self._clear_rules_btn = QPushButton("Clear")
+        self._clear_rules_btn.clicked.connect(self._clear_rules)
+        rules_btn_row.addWidget(self._clear_rules_btn)
+        rules_btn_row.addStretch()
+        rules_layout.addLayout(rules_btn_row)
+        root_layout.addWidget(rules_group)
 
         # --- Action buttons ---
         btn_layout = QHBoxLayout()
@@ -356,6 +409,33 @@ class MainWindow(QMainWindow):
         self._tree.itemDoubleClicked.connect(self._on_item_double_clicked)
         self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._on_context_menu)
+
+        # Override keyPressEvent so Space toggles KEEP/DELETE on all selected
+        # file rows at once (not just the focused item).
+        _orig_key = self._tree.keyPressEvent
+
+        def _tree_key_press(event):
+            if event.key() == Qt.Key.Key_Space:
+                selected = [
+                    si for si in self._tree.selectedItems()
+                    if si.parent() is not None  # file rows only
+                ]
+                if selected:
+                    self._tree.blockSignals(True)
+                    for si in selected:
+                        if si.checkState(0) == Qt.CheckState.Checked:
+                            si.setCheckState(0, Qt.CheckState.Unchecked)
+                            si.setText(0, "KEEP")
+                            si.setForeground(0, TEXT_COLOR_KEEP)
+                        else:
+                            si.setCheckState(0, Qt.CheckState.Checked)
+                            si.setText(0, "DELETE")
+                            si.setForeground(0, TEXT_COLOR_DEL)
+                    self._tree.blockSignals(False)
+                    return  # consumed
+            _orig_key(event)
+
+        self._tree.keyPressEvent = _tree_key_press
         root_layout.addWidget(self._tree, 1)
 
         # --- Bottom bar ---
@@ -368,6 +448,13 @@ class MainWindow(QMainWindow):
         )
         self._select_all_delete.clicked.connect(self._auto_select_newer)
         bottom.addWidget(self._select_all_delete)
+        self._apply_rules_btn = QPushButton("\U0001f4cb Apply Rules")
+        self._apply_rules_btn.setToolTip(
+            "Re-apply directory rules to the current scan results.\n"
+            "Preserve dirs \u2192 keep files; Expendable dirs \u2192 delete if copies exist elsewhere."
+        )
+        self._apply_rules_btn.clicked.connect(self._apply_rules)
+        bottom.addWidget(self._apply_rules_btn)
         self._select_all_keep = QPushButton("Deselect All")
         self._select_all_keep.clicked.connect(self._deselect_all)
         bottom.addWidget(self._select_all_keep)
@@ -395,6 +482,13 @@ class MainWindow(QMainWindow):
         s.setValue("geometry", self.saveGeometry())
         dirs = [self._dir_list.item(i).text() for i in range(self._dir_list.count())]
         s.setValue("last_dirs", dirs)
+        # Persist directory rules
+        rules = []
+        for i in range(self._rules_list.count()):
+            data = self._rules_list.item(i).data(Qt.ItemDataRole.UserRole)
+            if data:
+                rules.append(data)
+        s.setValue("last_rules", json.dumps(rules))
 
     def _restore_state(self):
         s = QSettings("FileDuplicator", "MainWindow")
@@ -407,6 +501,18 @@ class MainWindow(QMainWindow):
         for d in saved:
             if d and os.path.isdir(d):
                 self._dir_list.addItem(d)
+        # Restore directory rules
+        saved_rules = s.value("last_rules", "[]")
+        try:
+            rules = json.loads(saved_rules) if isinstance(saved_rules, str) else []
+        except (json.JSONDecodeError, TypeError):
+            rules = []
+        for r in rules:
+            if isinstance(r, dict) and "path" in r and "type" in r:
+                prefix = "\U0001f7e2 PRESERVE" if r["type"] == "preserve" else "\U0001f534 EXPENDABLE"
+                item = QListWidgetItem(f"{prefix}: {r['path']}")
+                item.setData(Qt.ItemDataRole.UserRole, r)
+                self._rules_list.addItem(item)
 
     def closeEvent(self, event):
         self._save_state()
@@ -433,6 +539,57 @@ class MainWindow(QMainWindow):
 
     def _clear_dirs(self):
         self._dir_list.clear()
+
+    # ---------------------------------------------------------- directory rules
+    def _add_rule(self, rule_type: str):
+        start = ""
+        if self._dir_list.count():
+            start = self._dir_list.item(self._dir_list.count() - 1).text()
+        d = QFileDialog.getExistingDirectory(self, f"Select {rule_type} directory", start)
+        if d:
+            prefix = "\U0001f7e2 PRESERVE" if rule_type == "preserve" else "\U0001f534 EXPENDABLE"
+            item = QListWidgetItem(f"{prefix}: {d}")
+            item.setData(Qt.ItemDataRole.UserRole, {"path": d, "type": rule_type})
+            self._rules_list.addItem(item)
+
+    def _remove_selected_rules(self):
+        for item in reversed(self._rules_list.selectedItems()):
+            self._rules_list.takeItem(self._rules_list.row(item))
+
+    def _clear_rules(self):
+        self._rules_list.clear()
+
+    def _get_rules(self) -> list:
+        """Return the current list of DirectoryRule objects from the UI."""
+        rules = []
+        for i in range(self._rules_list.count()):
+            data = self._rules_list.item(i).data(Qt.ItemDataRole.UserRole)
+            if data:
+                rules.append(DirectoryRule(path=data["path"], rule_type=data["type"]))
+        return rules
+
+    def _apply_rules(self):
+        """Re-apply directory rules to current scan results."""
+        rules = self._get_rules()
+        if not rules:
+            QMessageBox.information(self, "No rules", "Add at least one directory rule first.")
+            return
+        if not self._groups:
+            QMessageBox.information(self, "No results", "Run a scan first.")
+            return
+        self._rule_decisions = apply_directory_rules(self._groups, rules)
+        if not self._rule_decisions:
+            QMessageBox.information(
+                self, "No matches",
+                "No duplicate groups matched any directory rules.",
+            )
+            return
+        # Rebuild tree to reflect rule decisions
+        self._displayed = 0
+        self._start_batched_populate()
+        self._status.showMessage(
+            f"\U0001f4cb Rules applied: {len(self._rule_decisions)} files auto-marked.", 10_000
+        )
 
     def _parse_min_size(self) -> int:
         text = self._min_size_combo.currentText()
@@ -472,6 +629,11 @@ class MainWindow(QMainWindow):
         self._filter_label.setText("")
         self._scan_start_time = _time.monotonic()
 
+        index_path: str | None = None
+        if self._chk_save_index.isChecked():
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            index_path = os.path.join(roots[0], f"file_index_{ts}.csv")
+
         self._worker = ScanWorker(
             roots,
             by_name=by_name,
@@ -480,6 +642,7 @@ class MainWindow(QMainWindow):
             recursive=self._chk_recursive.isChecked(),
             min_size=self._parse_min_size(),
             use_sha256=self._hash_combo.currentIndex() == 1,
+            index_path=index_path,
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_finished)
@@ -508,6 +671,11 @@ class MainWindow(QMainWindow):
         self._groups = groups   # already sorted by wasted space from scanner
         self._stats = stats
         self._displayed = 0
+
+        # Apply directory rules if any are defined
+        rules = self._get_rules()
+        self._rule_decisions = apply_directory_rules(groups, rules) if rules else {}
+
         self._scan_elapsed = _time.monotonic() - self._scan_start_time
         self._scan_finished_at = datetime.now().isoformat()
 
@@ -522,8 +690,10 @@ class MainWindow(QMainWindow):
             )
             self._phase_label.setText("Scan complete – no duplicates.")
             self._progress.setValue(self._progress.maximum() or 1)
-            return
-
+        if stats.index_path:
+            self._status.showMessage(
+                f"No duplicates found.  ·  File index saved → {stats.index_path}", 15_000
+            )
         cap = self._cap_spin.value()
         showing = min(cap, len(groups))
 
@@ -542,7 +712,12 @@ class MainWindow(QMainWindow):
         self._phase_label.setText(
             f"Scan complete – loading {showing:,} of {len(groups):,} groups…"
         )
-        self._status.showMessage(f"Scan complete – {len(groups):,} groups found.", 10_000)
+        status_msg = f"Scan complete – {len(groups):,} groups found."
+        if stats.index_path:
+            status_msg += f"  ·  File index saved → {stats.index_path}"
+        if self._rule_decisions:
+            status_msg += f"  ·  📋 {len(self._rule_decisions)} files auto-marked by rules"
+        self._status.showMessage(status_msg, 15_000)
 
         # Start batched display
         self._start_batched_populate()
@@ -630,9 +805,23 @@ class MainWindow(QMainWindow):
         for fi, fe in enumerate(sorted_files):
             child = QTreeWidgetItem(group_item)
             child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            is_keep = fi == 0
+
+            # Check directory rules first, fall back to default (oldest = keep)
+            rule = self._rule_decisions.get(fe.path)
+            if rule == "keep":
+                is_keep, is_review = True, False
+            elif rule == "delete":
+                is_keep, is_review = False, False
+            elif rule == "review":
+                is_keep, is_review = True, True
+            else:
+                is_keep, is_review = (fi == 0), False
+
             child.setCheckState(0, Qt.CheckState.Unchecked if is_keep else Qt.CheckState.Checked)
-            child.setText(0, "KEEP" if is_keep else "DELETE")
+            if is_review:
+                child.setText(0, "\u26a0 REVIEW")
+            else:
+                child.setText(0, "KEEP" if is_keep else "DELETE")
             child.setText(1, fe.name)
             child.setText(2, fe.path)
             child.setText(3, _human_size(fe.size))
@@ -642,7 +831,10 @@ class MainWindow(QMainWindow):
             for col in range(5):
                 child.setBackground(col, color)
                 child.setForeground(col, TEXT_COLOR_LIGHT)
-            child.setForeground(0, TEXT_COLOR_KEEP if is_keep else TEXT_COLOR_DEL)
+            if is_review:
+                child.setForeground(0, TEXT_COLOR_REVIEW)
+            else:
+                child.setForeground(0, TEXT_COLOR_KEEP if is_keep else TEXT_COLOR_DEL)
 
     def _on_item_changed(self, item: QTreeWidgetItem, column: int):
         if column == 0 and item.parent() is not None:

@@ -21,6 +21,9 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Callable
 
+import csv as _csv
+from datetime import datetime as _datetime
+
 import xxhash
 import hashlib
 
@@ -95,6 +98,24 @@ class ScanStats:
     duplicate_files: int = 0
     reclaimable_bytes: int = 0
     hash_algorithm: str = "xxhash"
+    index_path: str = ""          # path to saved file index CSV, if any
+
+
+@dataclass(slots=True)
+class DirectoryRule:
+    """A rule that controls how files under a directory are treated.
+
+    *path*      – absolute directory path
+    *rule_type* – ``"preserve"`` or ``"expendable"``
+
+    **Preserve**:   files here are canonical – delete matching copies elsewhere.
+    **Expendable**: files here are junk copies – delete them if copies exist elsewhere.
+    """
+    path: str
+    rule_type: str          # "preserve" | "expendable"
+
+    PRESERVE   = "preserve"
+    EXPENDABLE = "expendable"
 
 
 # Callback types
@@ -306,6 +327,51 @@ def _parallel_hash_phase(
 
 
 # ---------------------------------------------------------------------------
+# File index writer
+# ---------------------------------------------------------------------------
+
+def _index_human_size(n: int | float) -> str:
+    """Compact human-readable file size for the index CSV."""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024:
+            return f"{n:,.1f} {unit}"
+        n /= 1024
+    return f"{n:,.1f} PB"
+
+
+def write_file_index(all_files: list[FileEntry], path: str) -> None:
+    """Write a full file-system index of every enumerated file to a CSV.
+
+    Columns: path, directory, filename, size_bytes, size, last_modified
+
+    This is separate from the duplicate report – it covers ALL files that
+    were seen during the scan, not just the ones that had duplicates.  It
+    acts like a lightweight IYF / Everything snapshot so you can grep for
+    a filename later without re-scanning the whole drive.
+    """
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = _csv.writer(f)
+        w.writerow(["# FileDuplicator File Index"])
+        w.writerow(["# Generated", _datetime.now().isoformat()])
+        w.writerow(["# Total Files", len(all_files)])
+        w.writerow([])
+        w.writerow(["path", "directory", "filename", "size_bytes", "size", "last_modified"])
+        for fe in all_files:
+            try:
+                mtime_str = _datetime.fromtimestamp(fe.mtime).isoformat() if fe.mtime else ""
+            except (OSError, ValueError, OverflowError):
+                mtime_str = ""
+            w.writerow([
+                fe.path,
+                os.path.dirname(fe.path),
+                fe.name,
+                fe.size,
+                _index_human_size(fe.size),
+                mtime_str,
+            ])
+
+
+# ---------------------------------------------------------------------------
 # Main scan function
 # ---------------------------------------------------------------------------
 
@@ -321,6 +387,7 @@ def scan_directory(
     progress: ProgressCallback | None = None,
     cancelled: CancelCheck | None = None,
     extra_skip_dirs: set[str] | None = None,
+    index_path: str | None = None,
 ) -> tuple[list[DuplicateGroup], ScanStats]:
     """
     Scan one or more directories for duplicate files.
@@ -385,6 +452,21 @@ def scan_directory(
         f"Phase 1 · {total_files:,} files found{cloud_msg}",
         total_files, total_files,
     )
+
+    # Write full file index if requested (all files, not just duplicates)
+    if index_path:
+        try:
+            write_file_index(all_files, index_path)
+            stats.index_path = index_path
+            _progress(
+                f"Phase 1 · File index saved ({total_files:,} files) → {index_path}",
+                total_files, total_files,
+            )
+        except Exception as _exc:
+            _progress(
+                f"Phase 1 · Warning: could not write file index: {_exc}",
+                total_files, total_files,
+            )
 
     if _cancelled() or total_files == 0:
         return [], stats
@@ -513,3 +595,90 @@ def scan_directory(
 
     _progress(f"Done · {len(results):,} duplicate groups", 1, 1)
     return results, stats
+
+
+# ---------------------------------------------------------------------------
+# Directory rule engine
+# ---------------------------------------------------------------------------
+
+def apply_directory_rules(
+    groups: list[DuplicateGroup],
+    rules: list[DirectoryRule],
+) -> dict[str, str]:
+    """Apply directory priority rules to duplicate groups.
+
+    For each group the logic is:
+
+    1. **Preserve wins**: if any file lives under a *preserve* path, keep it
+       and mark everything else for deletion.
+    2. **Conflict**: if *two or more* preserve paths both claim a copy, flag
+       the whole group for manual ``"review"`` (never auto-delete).
+    3. **Expendable**: if a file is under an *expendable* path *and* a safe
+       copy exists outside expendable paths, delete the expendable copy.
+       If *only* expendable copies exist, keep the oldest one.
+
+    Returns ``{filepath: "keep" | "delete" | "review"}`` for every file that
+    is affected by at least one rule.  Files in rule-free groups are omitted.
+    """
+    if not rules or not groups:
+        return {}
+
+    # Normalise rule paths once for fast prefix matching
+    norm_rules = [
+        (os.path.normcase(os.path.normpath(r.path)) + os.sep, r.rule_type)
+        for r in rules
+    ]
+
+    def _classify(filepath: str) -> str | None:
+        fp = os.path.normcase(os.path.normpath(filepath))
+        for rp, rt in norm_rules:
+            if fp.startswith(rp):
+                return rt
+        return None
+
+    decisions: dict[str, str] = {}
+
+    for group in groups:
+        preserve: list[FileEntry] = []
+        expendable: list[FileEntry] = []
+        neutral: list[FileEntry] = []
+
+        for fe in group.files:
+            c = _classify(fe.path)
+            if c == DirectoryRule.PRESERVE:
+                preserve.append(fe)
+            elif c == DirectoryRule.EXPENDABLE:
+                expendable.append(fe)
+            else:
+                neutral.append(fe)
+
+        # Skip groups where no rules apply
+        if not preserve and not expendable:
+            continue
+
+        if len(preserve) > 1:
+            # Conflict – multiple preserve paths claim the same content
+            for fe in group.files:
+                decisions[fe.path] = "review"
+        elif preserve:
+            # Clear canonical copy exists
+            for fe in preserve:
+                decisions[fe.path] = "keep"
+            for fe in expendable + neutral:
+                decisions[fe.path] = "delete"
+        elif expendable:
+            if neutral:
+                # Safe copies exist outside expendable paths
+                for fe in expendable:
+                    decisions[fe.path] = "delete"
+                for fe in neutral:
+                    decisions[fe.path] = "keep"
+            elif len(expendable) > 1:
+                # ALL copies are expendable – keep the oldest
+                sorted_exp = sorted(expendable, key=lambda f: f.mtime or 0)
+                decisions[sorted_exp[0].path] = "keep"
+                for fe in sorted_exp[1:]:
+                    decisions[fe.path] = "delete"
+            # else: single expendable copy with no safe copy elsewhere → keep
+
+    return decisions
