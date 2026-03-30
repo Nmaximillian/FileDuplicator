@@ -915,9 +915,14 @@ async function doDelete() {
         const res = await fetch("/api/delete", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ paths }),
+            body: JSON.stringify({ paths, job_id: currentJobId }),
         });
         const data = await res.json();
+
+        if (data.error) {
+            alert("Delete error: " + data.error);
+            return;
+        }
 
         // Remove deleted rows from the DOM
         const deletedSet = new Set(paths);
@@ -929,6 +934,22 @@ async function doDelete() {
         document.querySelectorAll(".dup-group").forEach((grp) => {
             if (grp.querySelectorAll("tr[data-path]").length <= 1) grp.remove();
         });
+
+        // Update summary stats to reflect the deletion
+        if (summaryData) {
+            const remainingGroups = document.querySelectorAll(".dup-group").length;
+            const remainingFiles = document.querySelectorAll("tr[data-path]").length;
+            summaryData.group_count = remainingGroups + (loadedGroupCount < totalGroupCount ? totalGroupCount - loadedGroupCount : 0);
+            summaryData.file_count = remainingFiles;
+            summaryData.reclaimable = Math.max(0, summaryData.reclaimable - fileInfoBefore.reduce((s, f) => s + f.size, 0));
+            summaryData.reclaimable_h = humanSize(summaryData.reclaimable);
+            summaryBar.innerHTML = `
+                <i class="bi bi-info-circle me-2"></i>
+                <strong>${summaryData.group_count.toLocaleString()}</strong>&nbsp;duplicate groups &nbsp;•&nbsp;
+                <strong>${summaryData.file_count.toLocaleString()}</strong>&nbsp;duplicate files &nbsp;•&nbsp;
+                <strong>${summaryData.reclaimable_h}</strong>&nbsp;reclaimable
+            `;
+        }
 
         // Show deletion result modal
         const totalFreed = fileInfoBefore.reduce((s, f) => s + f.size, 0);
@@ -1425,24 +1446,31 @@ async function fetchSSEBulkDelete(jobId, bar, countEl, deletedEl, freedEl, error
                     const data = JSON.parse(line.slice(6));
                     lastData = data;
 
-                    const pct = data.total > 0 ? Math.round((data.current / data.total) * 100) : 0;
-                    bar.style.width = pct + "%";
-                    bar.textContent = pct + "%";
-                    countEl.textContent = `${data.current.toLocaleString()} / ${data.total.toLocaleString()}`;
-                    deletedEl.textContent = data.deleted.toLocaleString();
-                    freedEl.textContent = data.freed_h;
-                    errorsEl.textContent = data.error_count.toLocaleString();
-
                     if (data.status === "done") {
+                        bar.style.width = "100%";
                         bar.classList.remove("progress-bar-animated");
                         bar.classList.replace("bg-danger", "bg-success");
                         bar.textContent = "Complete!";
+                        countEl.textContent = `${data.total.toLocaleString()} / ${data.total.toLocaleString()}`;
+                        deletedEl.textContent = data.deleted.toLocaleString();
+                        freedEl.textContent = data.freed_h;
+                        errorsEl.textContent = data.error_count.toLocaleString();
 
-                        // Wait a moment then show result
+                        // Wait a moment then show result and refresh groups
                         setTimeout(() => {
                             progressModal.hide();
                             showBulkDeleteResult(data);
+                            // Refresh groups from server (server-side groups are now updated)
+                            reloadResults();
                         }, 1000);
+                    } else {
+                        const pct = data.total > 0 ? Math.round((data.current / data.total) * 100) : 0;
+                        bar.style.width = pct + "%";
+                        bar.textContent = pct + "%";
+                        countEl.textContent = `${data.current.toLocaleString()} / ${data.total.toLocaleString()}`;
+                        deletedEl.textContent = data.deleted.toLocaleString();
+                        freedEl.textContent = data.freed_h;
+                        errorsEl.textContent = data.error_count.toLocaleString();
                     }
                 }
             }

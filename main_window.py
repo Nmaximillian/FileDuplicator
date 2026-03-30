@@ -1366,6 +1366,12 @@ class MainWindow(QMainWindow):
             if group_item.childCount() <= 1:
                 root.removeChild(group_item)
 
+        # Update in-memory groups so sort/export/load-more stay consistent
+        deleted_set = set(deleted_paths)
+        for grp in self._groups:
+            grp.files = [fe for fe in grp.files if fe.path not in deleted_set]
+        self._groups = [grp for grp in self._groups if len(grp.files) > 1]
+
         # Show result dialog with Export option
         self._show_deletion_result(len(deleted_paths), total_size, errors, deleted_info)
         self._status.showMessage(f"Deleted {len(deleted_paths)} files.", 10_000)

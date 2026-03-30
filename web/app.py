@@ -482,11 +482,52 @@ def api_compare():
     })
 
 
+def _remove_deleted_from_job(job_id: str, deleted_paths: set[str]):
+    """Remove deleted files from the server-side job groups so subsequent
+    fetches (sort, search, load-more, export) don't return stale data."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job or job["status"] != "done":
+        return
+
+    groups = job["groups"]
+    updated = []
+    for g in groups:
+        g["files"] = [f for f in g["files"] if f["path"] not in deleted_paths]
+        g["file_count"] = len(g["files"])
+        if g["file_count"] > 1:
+            updated.append(g)
+
+    # Re-number
+    for i, g in enumerate(updated):
+        g["index"] = i + 1
+    job["groups"] = updated
+
+    # Update summary
+    total_files = sum(g["file_count"] for g in updated)
+    total_waste = 0
+    for g in updated:
+        for f in g["files"][1:]:
+            total_waste += f["size"]
+    job["summary"]["group_count"] = len(updated)
+    job["summary"]["file_count"] = total_files
+    job["summary"]["reclaimable"] = total_waste
+    job["summary"]["reclaimable_h"] = _human_size(total_waste)
+
+    # Also clean up raw groups if present
+    raw_groups = job.get("_raw_groups")
+    if raw_groups:
+        for grp in raw_groups:
+            grp.files = [fe for fe in grp.files if fe.path not in deleted_paths]
+        job["_raw_groups"] = [grp for grp in raw_groups if len(grp.files) > 1]
+
+
 @app.route("/api/delete", methods=["POST"])
 def api_delete():
     """Delete a list of file paths."""
     data = request.get_json(force=True)
     paths: list[str] = data.get("paths", [])
+    job_id: str = data.get("job_id", "")
     if not paths:
         return jsonify({"error": "No paths given"}), 400
 
@@ -501,6 +542,10 @@ def api_delete():
                 errors.append({"path": p, "error": "File not found"})
         except Exception as exc:
             errors.append({"path": p, "error": str(exc)})
+
+    # Update server-side groups so subsequent fetches don't return stale data
+    if deleted and job_id:
+        _remove_deleted_from_job(job_id, set(deleted))
 
     return jsonify({"deleted": len(deleted), "errors": errors})
 
@@ -544,6 +589,7 @@ def api_delete_all_duplicates(job_id: str):
         deleted_count = 0
         freed_bytes = 0
         errors = []
+        deleted_paths = set()
 
         for i, f in enumerate(to_delete):
             path = f["path"]
@@ -552,6 +598,7 @@ def api_delete_all_duplicates(job_id: str):
                     os.remove(path)
                     deleted_count += 1
                     freed_bytes += f["size"]
+                    deleted_paths.add(path)
                 else:
                     errors.append({"path": path, "error": "File not found"})
             except Exception as exc:
@@ -569,6 +616,10 @@ def api_delete_all_duplicates(job_id: str):
                     "error_count": len(errors),
                 }
                 yield f"data: {json.dumps(payload)}\n\n"
+
+        # Update server-side groups to remove deleted files
+        if deleted_paths:
+            _remove_deleted_from_job(job_id, deleted_paths)
 
         # Final summary
         payload = {
