@@ -90,6 +90,7 @@ $("#bulkDeleteBtn").addEventListener("click", showBulkDeleteConfirm);
 $("#confirmBulkDeleteBtn").addEventListener("click", doBulkDelete);
 $("#exportCsvBtn").addEventListener("click", (e) => { e.preventDefault(); exportReport("csv"); });
 $("#exportJsonBtn").addEventListener("click", (e) => { e.preventDefault(); exportReport("json"); });
+$("#applyRulesBtn").addEventListener("click", applyRules);
 loadMoreBtn.addEventListener("click", loadMore);
 $("#pageSizeSpin").addEventListener("change", (e) => {
     let v = parseInt(e.target.value, 10);
@@ -1011,6 +1012,45 @@ function getSelectedPaths() {
 function exportReport(format) {
     if (!currentJobId) return alert("No scan results to export.");
     window.open(`/api/scan/${currentJobId}/export/${format}`, "_blank");
+}
+
+// ── Apply Rules (post-scan) ──
+async function applyRules() {
+    if (!currentJobId) return alert("No scan results. Run a scan first.");
+    if (dirRules.length === 0) return alert("Add at least one directory rule first.");
+
+    const btn = $("#applyRulesBtn");
+    btn.disabled = true;
+    btn.innerHTML = `<span class="spinner-border spinner-border-sm me-1"></span> Applying…`;
+
+    try {
+        const res = await fetch(`/api/scan/${currentJobId}/apply-rules`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ rules: dirRules.map(r => ({ path: r.path, type: r.type })) }),
+        });
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+
+        // Refresh summary and groups
+        if (data.summary) {
+            summaryData = data.summary;
+            showSummary(data.summary);
+        }
+        reloadResults();
+
+        const count = data.rules_applied || 0;
+        if (count > 0) {
+            phaseLabel.textContent = `\u2705 Rules applied: ${count.toLocaleString()} files auto-marked.`;
+        } else {
+            phaseLabel.textContent = "No files matched the directory rules.";
+        }
+    } catch (e) {
+        alert("Apply rules failed: " + e.message);
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = `<i class="bi bi-shield-check"></i> Apply Rules`;
+    }
 }
 
 // ── Browse modal ──

@@ -205,6 +205,9 @@ def api_scan_start():
             job["current"] = 0
             job["total"] = 0
 
+            # Persist raw groups so rules can be re-applied later
+            job["_raw_groups"] = groups
+
             # Apply directory rules if any
             rule_decisions = {}
             if dir_rules:
@@ -353,6 +356,53 @@ def api_scan_groups(job_id: str):
         "total": len(groups),
         "offset": offset,
         "has_more": (offset + limit) < len(groups),
+    })
+
+
+@app.route("/api/scan/<job_id>/apply-rules", methods=["POST"])
+def api_apply_rules(job_id: str):
+    """Re-apply directory rules to existing scan results without re-scanning."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "unknown job"}), 404
+    if job["status"] != "done":
+        return jsonify({"error": "scan not complete"}), 400
+
+    raw_groups = job.get("_raw_groups")
+    if not raw_groups:
+        return jsonify({"error": "Raw scan data no longer available. Please re-scan."}), 400
+
+    data = request.get_json(force=True)
+    raw_rules = data.get("rules", [])
+    dir_rules: list[DirectoryRule] = []
+    for r in raw_rules:
+        if isinstance(r, dict) and r.get("path") and r.get("type") in ("preserve", "expendable"):
+            dir_rules.append(DirectoryRule(path=r["path"], rule_type=r["type"]))
+
+    rule_decisions = apply_directory_rules(raw_groups, dir_rules) if dir_rules else {}
+
+    serialised = _serialise_groups(raw_groups, rule_decisions=rule_decisions)
+    serialised.sort(
+        key=lambda g: g["files"][0]["size"] if g["files"] else 0,
+        reverse=True,
+    )
+    for i, g in enumerate(serialised):
+        g["index"] = i + 1
+
+    total_files = sum(g["file_count"] for g in serialised)
+    total_waste = 0
+    for g in serialised:
+        for f in g["files"][1:]:
+            total_waste += f["size"]
+
+    job["groups"] = serialised
+    job["summary"]["rules_applied"] = len(rule_decisions)
+
+    return jsonify({
+        "ok": True,
+        "rules_applied": len(rule_decisions),
+        "summary": job["summary"],
     })
 
 
