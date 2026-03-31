@@ -1482,6 +1482,13 @@ async function fetchSSEBulkDelete(jobId, bar, countEl, deletedEl, freedEl, error
 }
 
 function showBulkDeleteResult(data) {
+    // Populate lastDeletionInfo so export buttons work
+    lastDeletionInfo = {
+        files: data.deleted_files || [],
+        count: data.deleted,
+        freed: data.freed,
+        errors: data.errors || [],
+    };
     let html = `<div class="mb-3">`;
     html += `<div class="d-flex gap-3 mb-3 justify-content-center">`;
     html += `<div class="text-center"><div class="fs-3 text-success fw-bold">${data.deleted.toLocaleString()}</div><div class="text-muted small">Files Deleted</div></div>`;

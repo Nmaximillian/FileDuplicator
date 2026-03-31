@@ -590,6 +590,7 @@ def api_delete_all_duplicates(job_id: str):
         freed_bytes = 0
         errors = []
         deleted_paths = set()
+        deleted_files = []
 
         for i, f in enumerate(to_delete):
             path = f["path"]
@@ -599,6 +600,13 @@ def api_delete_all_duplicates(job_id: str):
                     deleted_count += 1
                     freed_bytes += f["size"]
                     deleted_paths.add(path)
+                    deleted_files.append({
+                        "path": f["path"],
+                        "name": f.get("name", ""),
+                        "size": f["size"],
+                        "size_h": f.get("size_h", ""),
+                        "hash": f.get("hash", ""),
+                    })
                 else:
                     errors.append({"path": path, "error": "File not found"})
             except Exception as exc:
@@ -631,6 +639,7 @@ def api_delete_all_duplicates(job_id: str):
             "kept": len(to_keep),
             "errors": errors[:50],  # cap at 50 to avoid huge payload
             "error_count": len(errors),
+            "deleted_files": deleted_files,
         }
         yield f"data: {json.dumps(payload)}\n\n"
 
